@@ -530,7 +530,6 @@ Footer > .footer--key {
 }
 
 #day-list > ListItem Label {
-    color: inherit;
     width: 100%;
 }
 
