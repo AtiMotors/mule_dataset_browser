@@ -29,6 +29,9 @@ from textual.widgets import (
     Footer,
     Header,
     Input,
+    Label,
+    ListItem,
+    ListView,
     Static,
 )
 
@@ -515,24 +518,20 @@ Footer > .footer--key {
     background: #1f2335;
 }
 
-DayItem {
-    height: 1;
-    padding: 0 1;
-    color: #a9b1d6;
-}
-
-DayItem.--highlight {
+#day-list > ListItem {
     background: #1f2335;
+    color: #a9b1d6;
+    padding: 0 0;
 }
 
-DayItem.selected {
+#day-list > ListItem.--highlight {
     background: #2d3f6e;
     color: #7dcfff;
-    text-style: bold;
 }
 
-DayItem:hover {
-    background: #283457;
+#day-list > ListItem Label {
+    color: inherit;
+    width: 100%;
 }
 
 #dataset-panel {
@@ -753,34 +752,6 @@ FetchModal {
 # ─── Custom Widgets ───────────────────────────────────────────────────────────
 
 
-class DayItem(Static):
-    """A row in the day list panel."""
-
-    DEFAULT_CSS = ""
-
-    def __init__(self, day: str, count: int, selected: bool = False):
-        self._day = day
-        self._count = count
-        label = f"  {DAY_FULL[day]:<11}  {count:>3}"
-        super().__init__(label)
-        if selected:
-            self.add_class("selected")
-
-    @property
-    def day(self) -> str:
-        return self._day
-
-    def select(self) -> None:
-        self.add_class("selected")
-
-    def deselect(self) -> None:
-        self.remove_class("selected")
-
-    def update_count(self, count: int) -> None:
-        self._count = count
-        self.update(f"  {DAY_FULL[self._day]:<11}  {count:>3}")
-
-
 class DiffLine(Static):
     """A single line of unified diff output with appropriate styling."""
 
@@ -973,25 +944,20 @@ class MainScreen(Screen):
     """Primary dataset browsing screen: Day panel (left) + Dataset table (right)."""
 
     BINDINGS = [
-        Binding("j,down", "cursor_down", "Down", show=False),
-        Binding("k,up", "cursor_up", "Up", show=False),
-        Binding("tab,right", "focus_next", "Next panel", show=False),
-        Binding("shift+tab,left", "focus_previous", "Prev panel", show=False),
         Binding("enter", "open_detail", "Detail"),
         Binding("/", "search", "Search"),
         Binding("l", "jump_latest", "Latest"),
         Binding("f", "fetch", "Fetch"),
         Binding("q", "quit_app", "Quit"),
+        Binding("escape", "close_search", "Close search", show=False),
     ]
 
-    _selected_day_idx: reactive[int] = reactive(0)
     _search_filter: reactive[str] = reactive("")
 
     def __init__(self, source: DataSource, **kwargs):
         super().__init__(**kwargs)
         self._source = source
         self._days: List[DayBucket] = []
-        self._day_items: List[DayItem] = []
         self._current_datasets: List[DatasetMeta] = []
         self._search_active = False
 
@@ -1000,8 +966,7 @@ class MainScreen(Screen):
         with Horizontal(id="main-layout"):
             with Vertical(id="day-panel"):
                 yield Static("  Day", id="day-panel-title")
-                with Vertical(id="day-list"):
-                    pass  # populated in on_mount
+                yield ListView(id="day-list")
             with Vertical(id="dataset-panel"):
                 yield Static("", id="dataset-panel-title")
                 yield DataTable(id="dataset-table", zebra_stripes=True, cursor_type="row")
@@ -1027,14 +992,16 @@ class MainScreen(Screen):
 
     def _render_days(self, days: List[DayBucket]) -> None:
         self._days = days
-        day_list = self.query_one("#day-list", Vertical)
-        day_list.remove_children()
-        self._day_items = []
-        for i, bucket in enumerate(days):
-            item = DayItem(bucket.day, bucket.count, selected=(i == self._selected_day_idx))
-            self._day_items.append(item)
-            day_list.mount(item)
-        self._load_datasets(days[self._selected_day_idx].day)
+        day_list = self.query_one("#day-list", ListView)
+        day_list.clear()
+        for bucket in days:
+            label = f"  {DAY_FULL[bucket.day]:<11}  {bucket.count:>3}"
+            day_list.append(ListItem(Label(label), name=bucket.day))
+        # Focus day list first so user can immediately navigate
+        day_list.focus()
+        # Load first day
+        if days:
+            self._load_datasets(days[0].day)
 
     def _load_datasets(self, day: str) -> None:
         title = self.query_one("#dataset-panel-title", Static)
@@ -1079,54 +1046,49 @@ class MainScreen(Screen):
             mode_cell = f"[{mode_color}]{ds.mode}[/]" if mode_color else ds.mode
             table.add_row(date_str, day_str, ds.robot, mode_cell, dist, dur)
 
-    def _select_day(self, idx: int) -> None:
-        if not self._day_items or idx < 0 or idx >= len(self._day_items):
-            return
-        # Deselect previous
-        old_idx = int(self._selected_day_idx)
-        self._day_items[old_idx].deselect()
-        self._selected_day_idx = idx
-        self._day_items[idx].select()
-        self._load_datasets(self._days[idx].day)
-
-    # ── Key actions ──
-
-    def action_cursor_down(self) -> None:
-        focused = self.focused
-        if focused and focused.id == "dataset-table":
-            table = self.query_one("#dataset-table", DataTable)
-            table.action_scroll_down()
-        else:
-            self._select_day(min(self._selected_day_idx + 1, len(self._days) - 1))
-
-    def action_cursor_up(self) -> None:
-        focused = self.focused
-        if focused and focused.id == "dataset-table":
-            table = self.query_one("#dataset-table", DataTable)
-            table.action_scroll_up()
-        else:
-            self._select_day(max(self._selected_day_idx - 1, 0))
-
-    def action_open_detail(self) -> None:
+    def _get_selected_dataset(self) -> Optional[DatasetMeta]:
+        """Return the dataset under the DataTable cursor, or None."""
         table = self.query_one("#dataset-table", DataTable)
         if table.cursor_row is None:
-            return
+            return None
         filt = self._search_filter.lower()
         shown = [
             ds for ds in self._current_datasets
             if not filt or filt in ds.folder_name.lower() or filt in ds.robot.lower()
         ]
         if 0 <= table.cursor_row < len(shown):
-            dataset = shown[table.cursor_row]
+            return shown[table.cursor_row]
+        return None
+
+    # ── ListView event: day changed ──
+
+    @on(ListView.Highlighted, "#day-list")
+    def on_day_highlighted(self, event: ListView.Highlighted) -> None:
+        if event.item is not None and event.item.name:
+            self._load_datasets(event.item.name)
+
+    # ── Key actions ──
+
+    def action_open_detail(self) -> None:
+        focused = self.focused
+        if focused and focused.id == "day-list":
+            # Enter on day list → move focus to dataset table
+            self.query_one("#dataset-table", DataTable).focus()
+            return
+        dataset = self._get_selected_dataset()
+        if dataset:
             self.app.push_screen(DetailScreen(dataset, self._source))
 
     def action_search(self) -> None:
         search_bar = self.query_one("#search-bar", Input)
-        self._search_active = not self._search_active
+        self._search_active = True
+        search_bar.add_class("visible")
+        search_bar.focus()
+
+    def action_close_search(self) -> None:
         if self._search_active:
-            search_bar.add_class("visible")
-            search_bar.focus()
-        else:
+            search_bar = self.query_one("#search-bar", Input)
+            self._search_active = False
             search_bar.remove_class("visible")
             self._search_filter = ""
             search_bar.value = ""
@@ -1143,16 +1105,8 @@ class MainScreen(Screen):
         if not self._source.is_ssh:
             self.app.notify("Fetch is only available in SSH mode.", severity="warning")
             return
-        table = self.query_one("#dataset-table", DataTable)
-        if table.cursor_row is None:
-            return
-        filt = self._search_filter.lower()
-        shown = [
-            ds for ds in self._current_datasets
-            if not filt or filt in ds.folder_name.lower() or filt in ds.robot.lower()
-        ]
-        if 0 <= table.cursor_row < len(shown):
-            dataset = shown[table.cursor_row]
+        dataset = self._get_selected_dataset()
+        if dataset:
             self.app.push_screen(FetchModal(dataset, self._source))  # type: ignore[arg-type]
 
     def action_quit_app(self) -> None:
@@ -1165,7 +1119,6 @@ class MainScreen(Screen):
 
     @on(Input.Submitted, "#search-bar")
     def on_search_submitted(self) -> None:
-        # Move focus to table
         self.query_one("#dataset-table", DataTable).focus()
 
 
