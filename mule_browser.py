@@ -498,7 +498,7 @@ Footer > .footer--key {
 }
 
 #day-panel {
-    width: 18;
+    width: 22;
     border-right: solid #3b4261;
     background: #1f2335;
     padding: 0 1;
@@ -519,6 +519,7 @@ Footer > .footer--key {
 }
 
 #day-list > ListItem {
+    height: 1;
     background: #1f2335;
     color: #a9b1d6;
     padding: 0 0;
@@ -530,6 +531,7 @@ Footer > .footer--key {
 }
 
 #day-list > ListItem Label {
+    height: 1;
     width: 100%;
 }
 
@@ -943,7 +945,8 @@ class MainScreen(Screen):
     """Primary dataset browsing screen: Day panel (left) + Dataset table (right)."""
 
     BINDINGS = [
-        Binding("enter", "open_detail", "Detail"),
+        Binding("right", "focus_datasets", show=False),
+        Binding("left", "focus_days", show=False),
         Binding("/", "search", "Search"),
         Binding("l", "jump_latest", "Latest"),
         Binding("f", "fetch", "Fetch"),
@@ -1044,6 +1047,8 @@ class MainScreen(Screen):
             mode_color = MODE_COLORS.get(ds.mode, "")
             mode_cell = f"[{mode_color}]{ds.mode}[/]" if mode_color else ds.mode
             table.add_row(date_str, day_str, ds.robot, mode_cell, dist, dur)
+        if shown:
+            table.move_cursor(row=0)
 
     def _get_selected_dataset(self) -> Optional[DatasetMeta]:
         """Return the dataset under the DataTable cursor, or None."""
@@ -1059,24 +1064,26 @@ class MainScreen(Screen):
             return shown[table.cursor_row]
         return None
 
-    # ── ListView event: day changed ──
+    # ── Events ──
 
     @on(ListView.Highlighted, "#day-list")
     def on_day_highlighted(self, event: ListView.Highlighted) -> None:
         if event.item is not None and event.item.name:
             self._load_datasets(event.item.name)
 
-    # ── Key actions ──
-
-    def action_open_detail(self) -> None:
-        focused = self.focused
-        if focused and focused.id == "day-list":
-            # Enter on day list → move focus to dataset table
-            self.query_one("#dataset-table", DataTable).focus()
-            return
+    @on(DataTable.RowSelected, "#dataset-table")
+    def on_row_selected(self) -> None:
         dataset = self._get_selected_dataset()
         if dataset:
             self.app.push_screen(DetailScreen(dataset, self._source))
+
+    # ── Key actions ──
+
+    def action_focus_datasets(self) -> None:
+        self.query_one("#dataset-table", DataTable).focus()
+
+    def action_focus_days(self) -> None:
+        self.query_one("#day-list", ListView).focus()
 
     def action_search(self) -> None:
         search_bar = self.query_one("#search-bar", Input)
