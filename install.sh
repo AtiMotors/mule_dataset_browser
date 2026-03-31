@@ -3,17 +3,13 @@ set -e
 
 REPO_URL="${REPO_URL:-https://github.com/AtiMotors/mule_dataset_browser}"
 BINARY_NAME="browse_data"
-DEFAULT_INSTALL_DIR="$HOME/.local/bin"
+DEFAULT_INSTALL_DIR="/usr/local/bin"
 
 echo "Installing $BINARY_NAME..."
 
 echo "Checking prerequisites..."
-command -v python3 >/dev/null 2>&1 || {
-    echo "Error: python3 not found"
-    exit 1
-}
-command -v pip >/dev/null 2>&1 || {
-    echo "Error: pip not found"
+command -v git >/dev/null 2>&1 || {
+    echo "Error: git not found"
     exit 1
 }
 
@@ -28,7 +24,43 @@ git clone --depth 1 "$REPO_URL" "$TEMP_DIR" 2>/dev/null || {
 cd "$TEMP_DIR"
 
 echo "Installing dependencies..."
-pip install -r requirements.txt --quiet 2>/dev/null || pip install textual --quiet
+
+detect_os() {
+    if [ -f /etc/os-release ]; then
+        . /etc/os-release
+        case "$ID" in
+            ubuntu|debian|linuxmint|pop)
+                echo "ubuntu"
+                ;;
+            *)
+                echo "other"
+                ;;
+        esac
+    elif [ "$(uname)" = "Darwin" ]; then
+        echo "macos"
+    else
+        echo "other"
+    fi
+}
+
+OS=$(detect_os)
+
+if [ "$OS" = "ubuntu" ]; then
+    if apt list --installed 2>/dev/null | grep -q "^python3-textual/"; then
+        echo "Using system python3-textual"
+    elif command -v apt >/dev/null 2>&1 && [ "$(id -u)" -eq 0 ]; then
+        apt install -y python3-textual 2>/dev/null || pip install textual --quiet
+    elif command -v apt >/dev/null 2>&1; then
+        echo "Trying to install python3-textual (may require sudo)..."
+        sudo apt install -y python3-textual 2>/dev/null || pip install textual --quiet
+    else
+        pip install textual --quiet
+    fi
+elif [ "$OS" = "macos" ]; then
+    pip install textual --quiet 2>/dev/null || pip3 install textual --quiet
+else
+    pip install textual --quiet 2>/dev/null || pip3 install textual --quiet
+fi
 
 if [ ! -f "$BINARY_NAME" ]; then
     echo "Error: Binary '$BINARY_NAME' not found in repository"
@@ -36,14 +68,26 @@ if [ ! -f "$BINARY_NAME" ]; then
     exit 1
 fi
 
+echo ""
 echo -n "Enter install path [$DEFAULT_INSTALL_DIR]: "
-read -r INSTALL_DIR
-INSTALL_DIR="${INSTALL_DIR:-$DEFAULT_INSTALL_DIR}"
+read -r USER_INPUT
+INSTALL_DIR="${USER_INPUT:-$DEFAULT_INSTALL_DIR}"
 
-mkdir -p "$INSTALL_DIR"
+mkdir -p "$INSTALL_DIR" 2>/dev/null || true
 
-cp "$BINARY_NAME" "$INSTALL_DIR/"
-chmod +x "$INSTALL_DIR/$BINARY_NAME"
+if [ -w "$INSTALL_DIR" ]; then
+    cp "$BINARY_NAME" "$INSTALL_DIR/"
+    chmod +x "$INSTALL_DIR/$BINARY_NAME"
+elif [ -w "$(dirname "$INSTALL_DIR")" ] || [ "$(dirname "$INSTALL_DIR")" = "/usr/local" ]; then
+    sudo cp "$BINARY_NAME" "$INSTALL_DIR/"
+    sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
+else
+    FALLBACK_DIR="$HOME/.local/bin"
+    mkdir -p "$FALLBACK_DIR"
+    cp "$BINARY_NAME" "$FALLBACK_DIR/"
+    chmod +x "$FALLBACK_DIR/$BINARY_NAME"
+    INSTALL_DIR="$FALLBACK_DIR"
+fi
 
 rm -rf "$TEMP_DIR"
 
@@ -56,18 +100,6 @@ if [[ ":$PATH:" != *":$INSTALL_DIR:"* ]]; then
     echo "WARNING: $INSTALL_DIR is not in your PATH"
     echo "Add this to your ~/.bashrc or ~/.zshrc:"
     echo "  $PATH_LINE"
-    echo ""
-    echo "Or add to PATH now? (y/n)"
-    read -r ADD_TO_PATH
-    if [ "$ADD_TO_PATH" = "y" ] || [ "$ADD_TO_PATH" = "Y" ]; then
-        export PATH="$PATH:$INSTALL_DIR"
-        if [ -n "$BASH_VERSION" ]; then
-            echo "$PATH_LINE" >>~/.bashrc
-        elif [ -n "$ZSH_VERSION" ]; then
-            echo "$PATH_LINE" >>~/.zshrc
-        fi
-        echo "Added to PATH in shell config"
-    fi
 fi
 
 echo ""

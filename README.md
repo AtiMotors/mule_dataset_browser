@@ -2,11 +2,23 @@
 
 A terminal UI for browsing Ati Motors robot datasets — locally or over SSH.
 
+## Requirements
+
+The install script handles dependency installation automatically. If you want to install dependencies manually:
+
+| OS | Command |
+|----|---------|
+| Ubuntu/Debian | `sudo apt install python3-textual` |
+| macOS | `pip install textual` (requires pip) |
+| Other Linux | `pip install textual` |
+
 ## Installation
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/AtiMotors/mule_dataset_browser/main/install.sh | bash
 ```
+
+The script will prompt for the install location (default: `/usr/local/bin`).
 
 ## Usage
 
