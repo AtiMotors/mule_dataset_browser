@@ -10,6 +10,7 @@ Usage:
 from __future__ import annotations
 
 import argparse
+import ipaddress
 import re
 import subprocess
 from abc import ABC, abstractmethod
@@ -19,24 +20,29 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from rich.text import Text
-from textual import on, work
-from textual.app import App, ComposeResult
-from textual.binding import Binding
-from textual.containers import Container, Horizontal, Vertical
-from textual.reactive import reactive
-from textual.screen import ModalScreen, Screen
-from textual.widgets import (
-    Button,
-    DataTable,
-    Footer,
-    Header,
-    Input,
-    Label,
-    ListItem,
-    ListView,
-    ProgressBar,
-    Static,
-)
+try:
+    from textual import on, work
+    from textual.app import App, ComposeResult
+    from textual.binding import Binding
+    from textual.containers import Container, Horizontal, Vertical
+    from textual.reactive import reactive
+    from textual.screen import ModalScreen, Screen
+    from textual.widgets import (
+        Button,
+        DataTable,
+        Footer,
+        Header,
+        Input,
+        Label,
+        ListItem,
+        ListView,
+        ProgressBar,
+        Static,
+    )
+except ImportError:
+    print("Error: 'textual' is not installed.")
+    print("Please install it with: pip install textual")
+    exit(1)
 
 # ─── Constants ───────────────────────────────────────────────────────────────
 
@@ -54,6 +60,22 @@ DAY_FULL = {
     "Sat": "Saturday",
     "Sun": "Sunday",
 }
+
+
+def validate_host(host: str) -> tuple[bool, str]:
+    if not host or not host.strip():
+        return False, "Host address cannot be empty."
+    host = host.strip()
+    try:
+        ipaddress.ip_address(host)
+        return True, ""
+    except ValueError:
+        pass
+    if not re.match(r'^[a-zA-Z0-9]([a-zA-Z0-9\-\.]*[a-zA-Z0-9])?$', host):
+        return False, f"Invalid hostname format: '{host}'"
+    if len(host) > 253:
+        return False, f"Hostname too long: '{host}'"
+    return True, ""
 
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
@@ -134,7 +156,7 @@ def parse_folder_name(folder_name: str) -> Optional[Tuple[datetime, str, str]]:
 
 
 def format_size(size_bytes: int) -> str:
-    for unit in ["B", "KB", "MB", "GB", "TB"]:
+    for unit in [" B", " KB", " MB", " GB", " TB"]:
         if size_bytes < 1024:
             return f"{size_bytes:.1f}{unit}"
         size_bytes //= 1024
