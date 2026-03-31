@@ -25,7 +25,7 @@ python mule_browser.py --local
 
 | Key | Action |
 |-----|--------|
-| `↑/↓` or `j/k` | Navigate |
+| `↑/↓` | Navigate |
 | `Tab` / `←→` | Switch panels |
 | `Enter` | Open dataset detail |
 | `Esc` or `b` | Back |
