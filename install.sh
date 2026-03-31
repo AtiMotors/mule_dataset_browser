@@ -29,7 +29,7 @@ detect_os() {
     if [ -f /etc/os-release ]; then
         . /etc/os-release
         case "$ID" in
-            ubuntu|debian|linuxmint|pop)
+            ubuntu | debian | linuxmint | pop)
                 echo "ubuntu"
                 ;;
             *)
@@ -68,26 +68,16 @@ if [ ! -f "$BINARY_NAME" ]; then
     exit 1
 fi
 
+INSTALL_DIR="/usr/local/bin"
+
 echo ""
-echo -n "Enter install path [$DEFAULT_INSTALL_DIR]: "
-read -r USER_INPUT
-INSTALL_DIR="${USER_INPUT:-$DEFAULT_INSTALL_DIR}"
+echo "Installing to $INSTALL_DIR (requires sudo)..."
+sudo -v
 
-mkdir -p "$INSTALL_DIR" 2>/dev/null || true
-
-if [ -w "$INSTALL_DIR" ]; then
-    cp "$BINARY_NAME" "$INSTALL_DIR/"
-    chmod +x "$INSTALL_DIR/$BINARY_NAME"
-elif [ -w "$(dirname "$INSTALL_DIR")" ] || [ "$(dirname "$INSTALL_DIR")" = "/usr/local" ]; then
-    sudo cp "$BINARY_NAME" "$INSTALL_DIR/"
-    sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
-else
-    FALLBACK_DIR="$HOME/.local/bin"
-    mkdir -p "$FALLBACK_DIR"
-    cp "$BINARY_NAME" "$FALLBACK_DIR/"
-    chmod +x "$FALLBACK_DIR/$BINARY_NAME"
-    INSTALL_DIR="$FALLBACK_DIR"
-fi
+echo "sudo cp $BINARY_NAME $INSTALL_DIR/"
+sudo cp "$BINARY_NAME" "$INSTALL_DIR/"
+echo "sudo chmod +x $INSTALL_DIR/$BINARY_NAME"
+sudo chmod +x "$INSTALL_DIR/$BINARY_NAME"
 
 rm -rf "$TEMP_DIR"
 
@@ -104,4 +94,3 @@ fi
 
 echo ""
 echo "Done! Run '$BINARY_NAME' to start."
-
