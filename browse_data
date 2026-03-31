@@ -78,6 +78,27 @@ def validate_host(host: str) -> tuple[bool, str]:
     return True, ""
 
 
+def _parse_ssh_error(stderr: str, ip: str) -> str:
+    stderr_lower = stderr.lower()
+    if "connection refused" in stderr_lower:
+        return f"Connection refused. Robot at {ip} may be offline or SSH service not running."
+    elif "connection timed out" in stderr_lower or "timed out" in stderr_lower:
+        return f"Connection timed out. Check network connectivity to {ip}."
+    elif "no route to host" in stderr_lower or "network is unreachable" in stderr_lower:
+        return f"Cannot reach {ip}. Check network connection or firewall settings."
+    elif "permission denied" in stderr_lower or "authentication failed" in stderr_lower:
+        return f"Authentication failed. Check SSH credentials for {ip}."
+    elif "host key" in stderr_lower or "hostkey" in stderr_lower:
+        return f"Host key verification failed for {ip}. The robot may have been reconfigured."
+    elif "name or service not known" in stderr_lower:
+        return f"Cannot resolve {ip}. Check the address is correct."
+    elif "network is down" in stderr_lower:
+        return f"Network is down. Check network interface for {ip}."
+    elif not stderr.strip():
+        return "Unknown error (empty output). Check network and try again."
+    return stderr.strip()
+
+
 # ─── Data Models ─────────────────────────────────────────────────────────────
 
 
@@ -1232,6 +1253,10 @@ class IPInputScreen(Screen):
     def on_ip_submitted(self, event: Input.Submitted) -> None:
         ip = event.value.strip()
         if ip:
+            valid, msg = validate_host(ip)
+            if not valid:
+                self.app.notify(msg, title="Invalid Input", severity="error")
+                return
             self.app.connect_ssh(ip)
 
     def action_back(self) -> None:
@@ -1271,12 +1296,19 @@ class MuleBrowser(App):
 
     @work(thread=True)
     def connect_ssh(self, ip: str) -> None:
+        valid, msg = validate_host(ip)
+        if not valid:
+            self.call_from_thread(
+                self.push_screen, ErrorScreen(f"Invalid address: {ip}\n{msg}")
+            )
+            return
         source = SSHSource(ip)
         try:
             source.connect()
         except Exception as exc:
+            error_msg = _parse_ssh_error(str(exc), ip)
             self.call_from_thread(
-                self.push_screen, ErrorScreen(f"Cannot connect to {ip}:\n{exc}")
+                self.push_screen, ErrorScreen(f"Cannot connect to {ip}:\n{error_msg}")
             )
             return
         self.call_from_thread(self.switch_source, source)
