@@ -12,6 +12,12 @@ command -v git >/dev/null 2>&1 || {
     echo "Error: git not found"
     exit 1
 }
+command -v ssh >/dev/null 2>&1 || {
+    echo "Error: ssh not found. SSH mode will not work."
+}
+command -v rsync >/dev/null 2>&1 || {
+    echo "Error: rsync not found. Downloading datasets (Fetch) will not work."
+}
 
 echo "Cloning repository..."
 TEMP_DIR=$(mktemp -d)

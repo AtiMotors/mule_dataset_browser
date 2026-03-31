@@ -1286,7 +1286,7 @@ class IPInputScreen(Screen):
         if ip:
             valid, msg = validate_host(ip)
             if not valid:
-                self.app.notify(msg, title="Invalid Input", severity="error")
+                self.app.notify(escape(msg), title="Invalid Input", severity="error")
                 return
             self.app.connect_ssh(ip)
 
