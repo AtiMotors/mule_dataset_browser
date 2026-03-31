@@ -20,6 +20,7 @@ from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
 from rich.text import Text
+from rich.markup import escape
 try:
     from textual import on, work
     from textual.app import App, ComposeResult
@@ -765,7 +766,9 @@ class FetchModal(ModalScreen):
                 self.app.call_from_thread(self.dismiss, True)
             else:
                 stderr = proc.stderr.read() if proc.stderr else ""
-                self.app.call_from_thread(status.update, f"rsync failed: {stderr}")
+                self.app.call_from_thread(
+                    status.update, f"rsync failed: {escape(stderr)}"
+                )
                 self._fetching = False
                 self.app.call_from_thread(
                     lambda: setattr(
@@ -774,7 +777,7 @@ class FetchModal(ModalScreen):
                 )
 
         except Exception as exc:
-            self.app.call_from_thread(status.update, f"Error: {exc}")
+            self.app.call_from_thread(status.update, f"Error: {escape(str(exc))}")
             self._fetching = False
 
 
@@ -801,11 +804,11 @@ class DetailScreen(Screen):
     def action_copy_path(self) -> None:
         path = self._source.get_dataset_path(self._dataset)
         self.app.copy_to_clipboard(path)
-        self.app.notify(f"Copied: {path}")
+        self.app.notify(f"Copied: {escape(path)}")
 
     @staticmethod
     def _field(label: str, value: str, value_color: str = "#e0e0e0") -> Static:
-        markup = f"[dim]{label:<14}[/]  [{value_color}]{value}[/]"
+        markup = f"[dim]{label:<14}[/]  [{value_color}]{escape(str(value))}[/]"
         return Static(markup, classes="info-field")
 
     def compose(self) -> ComposeResult:
@@ -817,7 +820,7 @@ class DetailScreen(Screen):
         with Horizontal(id="detail-layout"):
             with Vertical(id="info-panel"):
                 yield Static("Run Info", id="info-card-title")
-                yield Static(ds.folder_name, id="info-card-folder")
+                yield Static(escape(ds.folder_name), id="info-card-folder")
                 yield self._field("Robot", ds.robot, "#00ffcc")
                 if ds.ip:
                     yield self._field("IP", ds.ip)
@@ -920,7 +923,7 @@ class DetailScreen(Screen):
     ) -> None:
         # Map Info
         map_widget = self.query_one("#info-card-map", Static)
-        map_widget.update(f"[dim]{'Map':<14}[/]  [#ff99ff]{map_name}[/]")
+        map_widget.update(f"[dim]{'Map':<14}[/]  [#ff99ff]{escape(map_name)}[/]")
 
         # Config Changes
         config_container = self.query_one("#config-content", Vertical)
@@ -1209,7 +1212,7 @@ class MainScreen(Screen):
         if dataset:
             path = self._source.get_dataset_path(dataset)
             self.app.copy_to_clipboard(path)
-            self.app.notify(f"Copied: {path}")
+            self.app.notify(f"Copied: {escape(path)}")
 
     def action_quit_app(self) -> None:
         self.app.exit()
