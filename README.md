@@ -2,23 +2,23 @@
 
 A terminal UI for browsing Ati Motors robot datasets — locally or over SSH.
 
-## Setup
+## Installation
 
 ```bash
-pip install -r requirements.txt
+curl -fsSL https://raw.githubusercontent.com/AtiMotors/mule_dataset_browser/main/install.sh | bash
 ```
 
 ## Usage
 
 ```bash
 # Startup menu (choose Local or Robot)
-python mule_browser.py
+browse_data
 
 # SSH mode directly
-python mule_browser.py 192.168.6.180
+browse_data 192.168.6.180
 
 # Local mode directly
-python mule_browser.py --local
+browse_data --local
 ```
 
 ## Keybindings
@@ -32,6 +32,7 @@ python mule_browser.py --local
 | `/` | Search/filter |
 | `l` | Jump to latest |
 | `f` | Fetch dataset (SSH mode only) |
+| `y` | Copy dataset path to clipboard |
 | `q` | Quit |
 
 ## Data layout

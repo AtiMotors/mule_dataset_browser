@@ -3,8 +3,8 @@
 Mule Dataset Browser — standalone TUI for browsing Ati Motors robot datasets.
 
 Usage:
-  python mule_browser.py 192.168.x.x   # SSH mode (direct)
-  python mule_browser.py               # startup menu: [L] Local  [R] Robot
+  browse_data 192.168.x.x   # SSH mode (direct)
+  browse_data               # startup menu: [L] Local  [R] Robot
 """
 
 from __future__ import annotations
@@ -364,6 +364,10 @@ class DataSource(ABC):
     def is_ssh(self) -> bool:
         pass
 
+    @abstractmethod
+    def get_dataset_path(self, dataset: DatasetMeta) -> str:
+        pass
+
 
 class LocalSource(DataSource):
     def __init__(self, data_path: Path = LOCAL_DATA_PATH):
@@ -377,6 +381,9 @@ class LocalSource(DataSource):
     @property
     def is_ssh(self) -> bool:
         return False
+
+    def get_dataset_path(self, dataset: DatasetMeta) -> str:
+        return str(self._path / dataset.folder_name)
 
     def _load_all(self) -> Dict[str, List[DatasetMeta]]:
         if self._cache:
@@ -446,6 +453,10 @@ class SSHSource(DataSource):
     @property
     def is_ssh(self) -> bool:
         return True
+
+    def get_dataset_path(self, dataset: DatasetMeta) -> str:
+        day = weekday_from_date(dataset.date)
+        return f"{ROBOT_BASE_PATH}/{day}/{dataset.folder_name}"
 
     def _ssh(self, cmd: str) -> str:
         result = subprocess.run(
@@ -772,6 +783,7 @@ class DetailScreen(Screen):
         Binding("escape", "back", "Back"),
         Binding("b", "back", "Back", show=False),
         Binding("f", "fetch", "Fetch"),
+        Binding("y", "copy_path", "Copy Path"),
         Binding("q", "quit_app", "Quit"),
     ]
 
@@ -785,6 +797,11 @@ class DetailScreen(Screen):
             self.app.notify("Fetch is only available in SSH mode.", severity="warning")
             return
         self.app.push_screen(FetchModal(self._dataset, self._source))
+
+    def action_copy_path(self) -> None:
+        path = self._source.get_dataset_path(self._dataset)
+        self.app.copy_to_clipboard(path)
+        self.app.notify(f"Copied: {path}")
 
     @staticmethod
     def _field(label: str, value: str, value_color: str = "#e0e0e0") -> Static:
@@ -821,7 +838,7 @@ class DetailScreen(Screen):
                 if ds.transition_reason:
                     yield self._field("Reason", ds.transition_reason)
                 yield Static(
-                    "[dim]Esc · b  Back   f  Fetch (SSH)   q  Quit[/]",
+                    "[dim]Esc · b  Back   f  Fetch (SSH)   y  Copy Path   q  Quit[/]",
                     id="info-card-footer",
                 )
 
@@ -991,6 +1008,7 @@ class MainScreen(Screen):
         Binding("/", "search", "Search"),
         Binding("l", "jump_latest", "Latest"),
         Binding("f", "fetch", "Fetch"),
+        Binding("y", "copy_path", "Copy Path"),
         Binding("q", "quit_app", "Quit"),
         Binding("escape", "close_search", "Close search", show=False),
     ]
@@ -1040,6 +1058,9 @@ class MainScreen(Screen):
             # Re-fetch days to get accurate counts from the populated cache
             days = self._source.list_days()
         except Exception as exc:
+            self.app.call_from_thread(
+                self.query_one("#loading-overlay", Container).remove_class, "visible"
+            )
             self.app.call_from_thread(self.app.push_screen, ErrorScreen(str(exc)))
             return
         self.app.call_from_thread(self._render_days, days)
@@ -1182,6 +1203,13 @@ class MainScreen(Screen):
         dataset = self._get_selected_dataset()
         if dataset:
             self.app.push_screen(FetchModal(dataset, self._source))
+
+    def action_copy_path(self) -> None:
+        dataset = self._get_selected_dataset()
+        if dataset:
+            path = self._source.get_dataset_path(dataset)
+            self.app.copy_to_clipboard(path)
+            self.app.notify(f"Copied: {path}")
 
     def action_quit_app(self) -> None:
         self.app.exit()
