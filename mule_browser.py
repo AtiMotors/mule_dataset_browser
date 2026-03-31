@@ -18,6 +18,7 @@ from datetime import datetime
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
+from rich.text import Text
 from textual import on, work
 from textual.app import App, ComposeResult
 from textual.binding import Binding
@@ -25,6 +26,7 @@ from textual.containers import Container, Horizontal, Vertical
 from textual.reactive import reactive
 from textual.screen import ModalScreen, Screen
 from textual.widgets import (
+    Button,
     DataTable,
     Footer,
     Header,
@@ -32,6 +34,7 @@ from textual.widgets import (
     Label,
     ListItem,
     ListView,
+    ProgressBar,
     Static,
 )
 
@@ -52,13 +55,6 @@ DAY_FULL = {
     "Sun": "Sunday",
 }
 
-# Mode → color mapping (used in table and badges)
-MODE_COLORS = {
-    "fleet": "green",
-    "manual": "yellow",
-    "simulation": "blue",
-    "off": "dim",
-}
 
 # ─── Data Models ─────────────────────────────────────────────────────────────
 
@@ -75,42 +71,58 @@ class DatasetMeta:
     software_tag: str
     commit_id: str
     transition_reason: str
+    user: str = ""
+    size_bytes: int = 0
     raw_info: str = field(default="", repr=False)
 
 
 @dataclass
-class ConfigDiff:
-    lines: List[str]
-    is_empty: bool
+class StoppageEntry:
+    timestamp: datetime
+    status: str
+
+
+@dataclass
+class TripLogEntry:
+    frame_id: str
+    time: datetime
+    status: str
+    trip_id: str
+    trip_leg_id: str
+    start_pose: str
+    destination: str
+    destination_pose: str
+    idle_time: float
+    unparking_time: float
+    parking_time: float
+    transit_time: float
+    total_waiting_time: float
+    obstacle_waiting_time: float
+    visa_waiting_time: float
+    exceptions_waiting_time: float
 
 
 # ─── Parsers ─────────────────────────────────────────────────────────────────
 
-_FOLDER_RE = re.compile(
-    r"^(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})-(\d{2})-(.+)$"
-)
+_FOLDER_RE = re.compile(r"^(\d{4}-\d{2}-\d{2})-(\d{2})-(\d{2})-(\d{2})-(.+)$")
 
 
 def parse_folder_name(folder_name: str) -> Optional[Tuple[datetime, str, str]]:
-    """Return (date, robot, mode) from a dataset folder name, or None if unparseable."""
     m = _FOLDER_RE.match(folder_name)
     if not m:
         return None
     date_str = m.group(1)
     h, mi, s = m.group(2), m.group(3), m.group(4)
-    rest = m.group(5)  # robot-customer-location-site-mode[_tag]
+    rest = m.group(5)
     try:
         dt = datetime.strptime(f"{date_str} {h}:{mi}:{s}", "%Y-%m-%d %H:%M:%S")
     except ValueError:
         return None
 
     parts = rest.split("-")
-    # mode is always the last hyphen-separated segment (may have _tag suffix)
     mode_raw = parts[-1] if parts else "unknown"
-    mode = mode_raw.split("_")[0]  # strip _tag suffix if present
+    mode = mode_raw.split("_")[0]
 
-    # robot name is everything except the last 4 parts (customer/location/site/mode)
-    # folder: robot-customer-location-site-mode  →  min 5 parts
     if len(parts) >= 5:
         robot = "-".join(parts[:-4])
     elif len(parts) >= 2:
@@ -121,20 +133,20 @@ def parse_folder_name(folder_name: str) -> Optional[Tuple[datetime, str, str]]:
     return dt, robot, mode
 
 
-def parse_info_txt(raw: str) -> Dict[str, str]:
-    """
-    Parse info.txt into a flat dict.
+def format_size(size_bytes: int) -> str:
+    for unit in ["B", "KB", "MB", "GB", "TB"]:
+        if size_bytes < 1024:
+            return f"{size_bytes:.1f}{unit}"
+        size_bytes //= 1024
+    return f"{size_bytes:.1f}PB"
 
-    The file has two sections:
-    1. Header lines: "key: value" or "key:value"
-    2. A final run summary line: "key: value, key: value, ..."
-    """
+
+def parse_info_txt(raw: str) -> Dict[str, str]:
     result: Dict[str, str] = {}
     for line in raw.splitlines():
         line = line.strip()
         if not line:
             continue
-        # Detect the comma-separated run summary line by looking for multiple k:v pairs
         if ", " in line and "run_id:" in line:
             for pair in line.split(", "):
                 if ":" in pair:
@@ -147,7 +159,6 @@ def parse_info_txt(raw: str) -> Dict[str, str]:
 
 
 def build_dataset_meta(folder_name: str, raw_info: str) -> DatasetMeta:
-    """Construct DatasetMeta from folder name + raw info.txt content."""
     parsed = parse_folder_name(folder_name)
     info = parse_info_txt(raw_info)
 
@@ -158,13 +169,21 @@ def build_dataset_meta(folder_name: str, raw_info: str) -> DatasetMeta:
         robot_from_name = "unknown"
         mode_from_name = "unknown"
 
-    # Prefer info.txt values over folder name parsing where available
-    robot = info.get("sherpa", robot_from_name).split()[0] if "sherpa" in info else robot_from_name
-    ip = info.get("sherpa", "").split()[-1] if "sherpa" in info and len(info.get("sherpa", "").split()) > 1 else ""
+    robot = (
+        info.get("sherpa", robot_from_name).split()[0]
+        if "sherpa" in info
+        else robot_from_name
+    )
+    ip = (
+        info.get("sherpa", "").split()[-1]
+        if "sherpa" in info and len(info.get("sherpa", "").split()) > 1
+        else ""
+    )
     mode = info.get("mode", mode_from_name)
     software_tag = info.get("software_tag", "")
     commit_id = info.get("commit_id", "")[:8]
     transition_reason = info.get("transition_reason", "")
+    user = info.get("user", "")
 
     try:
         distance_m = float(info.get("distance_m", "0"))
@@ -176,7 +195,6 @@ def build_dataset_meta(folder_name: str, raw_info: str) -> DatasetMeta:
     except ValueError:
         duration_mins = 0.0
 
-    # Parse start time from info if available (more precise than folder name)
     start_str = info.get("start_time", "")
     if start_str:
         try:
@@ -195,18 +213,79 @@ def build_dataset_meta(folder_name: str, raw_info: str) -> DatasetMeta:
         software_tag=software_tag,
         commit_id=commit_id,
         transition_reason=transition_reason,
+        user=user,
         raw_info=raw_info,
     )
 
 
-def parse_config_diff(raw: str) -> ConfigDiff:
-    """Parse config-changes.txt into a ConfigDiff."""
+def parse_stoppages(raw: str) -> List[StoppageEntry]:
+    entries: List[StoppageEntry] = []
     lines = raw.splitlines()
-    return ConfigDiff(lines=lines, is_empty=len(lines) == 0 or not raw.strip())
+    if not lines:
+        return entries
+    for line in lines[1:]:
+        parts = line.split(",", 10)
+        if len(parts) < 9:
+            continue
+        try:
+            vel_factor = float(parts[8])
+        except ValueError:
+            continue
+        if vel_factor != 0.0:
+            continue
+        try:
+            ts = datetime.fromtimestamp(float(parts[1]))
+        except (ValueError, OSError):
+            continue
+        status = parts[7].strip()
+        entries.append(StoppageEntry(timestamp=ts, status=status))
+    return entries
+
+
+def parse_trip_log(raw: str) -> List[TripLogEntry]:
+    entries: List[TripLogEntry] = []
+    lines = raw.splitlines()
+    if not lines or len(lines) < 2:
+        return entries
+    # frame_id,time,status,trip_id,trip_leg_id,start_pose,destination,destination_pose,idle_time,unparking_time,parking_time,transit_time,total_waiting_time,obstacle_waiting_time,visa_waiting_time,exceptions_waiting_time
+    for line in lines[1:]:
+        parts = line.split(",")
+        if len(parts) < 16:
+            continue
+        try:
+            ts = datetime.fromtimestamp(float(parts[1]))
+        except (ValueError, OSError):
+            continue
+
+        def _to_f(val: str) -> float:
+            try:
+                return float(val.strip() or 0.0)
+            except ValueError:
+                return 0.0
+
+        entry = TripLogEntry(
+            frame_id=parts[0].strip(),
+            time=ts,
+            status=parts[2].strip(),
+            trip_id=parts[3].strip(),
+            trip_leg_id=parts[4].strip(),
+            start_pose=parts[5].strip(),
+            destination=parts[6].strip(),
+            destination_pose=parts[7].strip(),
+            idle_time=_to_f(parts[8]),
+            unparking_time=_to_f(parts[9]),
+            parking_time=_to_f(parts[10]),
+            transit_time=_to_f(parts[11]),
+            total_waiting_time=_to_f(parts[12]),
+            obstacle_waiting_time=_to_f(parts[13]),
+            visa_waiting_time=_to_f(parts[14]),
+            exceptions_waiting_time=_to_f(parts[15]),
+        )
+        entries.append(entry)
+    return entries
 
 
 def weekday_from_date(dt: datetime) -> str:
-    """Return 3-letter weekday name (Mon, Tue, ...) from datetime."""
     return dt.strftime("%a")
 
 
@@ -215,37 +294,35 @@ def weekday_from_date(dt: datetime) -> str:
 
 @dataclass
 class DayBucket:
-    day: str          # "Mon", "Tue", etc.
+    day: str
     count: int
 
 
 class DataSource(ABC):
     @abstractmethod
     def list_days(self) -> List[DayBucket]:
-        """Return all 7 day buckets (Mon–Sun) with dataset counts."""
+        pass
 
     @abstractmethod
     def list_datasets(self, day: str) -> List[DatasetMeta]:
-        """Return DatasetMeta list for the given day, sorted newest-first."""
+        pass
 
     @abstractmethod
     def read_file(self, dataset: DatasetMeta, filename: str) -> str:
-        """Return raw file contents as string, or empty string if missing."""
+        pass
 
     @property
     @abstractmethod
     def label(self) -> str:
-        """Short label for the header (e.g., robot name + IP, or 'Local')."""
+        pass
 
     @property
     @abstractmethod
     def is_ssh(self) -> bool:
-        """Whether this source uses SSH (enables fetch feature)."""
+        pass
 
 
 class LocalSource(DataSource):
-    """Reads datasets from ~/data/ (flat folder, grouped by weekday from date prefix)."""
-
     def __init__(self, data_path: Path = LOCAL_DATA_PATH):
         self._path = data_path
         self._cache: Dict[str, List[DatasetMeta]] = {}
@@ -279,6 +356,17 @@ class LocalSource(DataSource):
             except FileNotFoundError:
                 raw_info = ""
             meta = build_dataset_meta(entry.name, raw_info)
+            try:
+                size = subprocess.run(
+                    ["du", "-sb", str(entry)],
+                    capture_output=True,
+                    text=True,
+                    timeout=10,
+                )
+                if size.returncode == 0:
+                    meta.size_bytes = int(size.stdout.split()[0])
+            except Exception:
+                pass
             grouped[day].append(meta)
         for day in grouped:
             grouped[day].sort(key=lambda m: m.date, reverse=True)
@@ -302,8 +390,6 @@ class LocalSource(DataSource):
 
 
 class SSHSource(DataSource):
-    """Reads datasets from a robot over SSH."""
-
     def __init__(self, ip: str):
         self._ip = ip
         self._robot_name: str = ""
@@ -319,25 +405,22 @@ class SSHSource(DataSource):
         return True
 
     def _ssh(self, cmd: str) -> str:
-        """Run a command on the robot via SSH, return stdout."""
         result = subprocess.run(
             ["ssh", "-o", "ConnectTimeout=10", f"{ROBOT_USER}@{self._ip}", cmd],
             capture_output=True,
             text=True,
-            timeout=30,
+            timeout=45,
         )
         if result.returncode != 0:
             raise RuntimeError(result.stderr.strip())
         return result.stdout
 
     def connect(self) -> None:
-        """Verify connectivity and grab robot hostname."""
         out = self._ssh("hostname")
         self._robot_name = out.strip()
 
     def list_days(self) -> List[DayBucket]:
-        if self._cache:
-            return [DayBucket(day=d, count=len(self._cache.get(d, []))) for d in DAY_ORDER]
+        # Use a simple 'ls | wc -l' as requested by the user
         result = []
         for day in DAY_ORDER:
             try:
@@ -351,24 +434,49 @@ class SSHSource(DataSource):
     def list_datasets(self, day: str) -> List[DatasetMeta]:
         if day in self._cache:
             return self._cache[day]
+
+        script = f"""
+        for d in {ROBOT_BASE_PATH}/{day}/*; do
+            if [ -d "$d" ]; then
+                echo "<<<FOLDER:$(basename "$d")>>>"
+                du -sb "$d" | cut -f1 | tr -d '\\n'
+                echo ""
+                cat "$d/info.txt" 2>/dev/null || true
+                echo "<<<END>>>"
+            fi
+        done
+        """
         try:
-            out = self._ssh(f"ls {ROBOT_BASE_PATH}/{day}/")
-            folders = [f.strip() for f in out.splitlines() if f.strip()]
+            out = self._ssh(script)
         except Exception:
             return []
 
         datasets = []
-        for folder in folders:
-            try:
-                raw_info = self._ssh(
-                    f"cat {ROBOT_BASE_PATH}/{day}/{folder}/info.txt 2>/dev/null || true"
-                )
-            except Exception:
-                raw_info = ""
-            meta = build_dataset_meta(folder, raw_info)
-            # For SSH mode we know the IP
+        current_folder = None
+        current_info = []
+        current_size = 0
+
+        for line in out.splitlines():
+            if line.startswith("<<<FOLDER:") and line.endswith(">>>"):
+                if current_folder:
+                    meta = build_dataset_meta(current_folder, "\n".join(current_info))
+                    if not meta.ip:
+                        meta.ip = self._ip
+                    meta.size_bytes = current_size
+                    datasets.append(meta)
+                current_folder = line[10:-3]
+                current_info = []
+                current_size = 0
+            elif current_folder is not None and not current_info and line.isdigit():
+                current_size = int(line)
+            elif line != "<<<END>>>":
+                current_info.append(line)
+
+        if current_folder:
+            meta = build_dataset_meta(current_folder, "\n".join(current_info))
             if not meta.ip:
                 meta.ip = self._ip
+            meta.size_bytes = current_size
             datasets.append(meta)
 
         datasets.sort(key=lambda m: m.date, reverse=True)
@@ -376,7 +484,6 @@ class SSHSource(DataSource):
         return datasets
 
     def read_file(self, dataset: DatasetMeta, filename: str) -> str:
-        # We need to find which day bucket this dataset belongs to
         day = weekday_from_date(dataset.date)
         path = f"{ROBOT_BASE_PATH}/{day}/{dataset.folder_name}/{filename}"
         try:
@@ -384,16 +491,23 @@ class SSHSource(DataSource):
         except Exception:
             return ""
 
-    def fetch_dataset(self, dataset: DatasetMeta, dest: Path = LOCAL_DATA_PATH) -> subprocess.Popen:
-        """Start an rsync subprocess to fetch the dataset. Returns the Popen handle."""
+    def fetch_dataset(self, dataset: DatasetMeta, dest: Path) -> subprocess.Popen:
         day = weekday_from_date(dataset.date)
         remote_path = f"{ROBOT_BASE_PATH}/{day}/{dataset.folder_name}"
         dest.mkdir(parents=True, exist_ok=True)
         return subprocess.Popen(
-            ["rsync", "-avzP", f"{ROBOT_USER}@{self._ip}:{remote_path}", str(dest)],
+            [
+                "rsync",
+                "-avz",
+                "--info=progress2",
+                f"{ROBOT_USER}@{self._ip}:{remote_path}",
+                str(dest),
+            ],
             stdout=subprocess.PIPE,
             stderr=subprocess.PIPE,
             text=True,
+            bufsize=1,
+            universal_newlines=True,
         )
 
 
@@ -402,382 +516,106 @@ class SSHSource(DataSource):
 APP_CSS = """
 /* ── Global ── */
 Screen {
-    background: #1a1b26;
-    color: #c0caf5;
+    background: #0d0d0d;
+    color: #e0e0e0;
+    scrollbar-color: #00ffcc;
+    scrollbar-background: #111111;
 }
 
-/* ── Header ── */
-Header {
-    background: #16213e;
-    color: #c0caf5;
-    height: 1;
-    dock: top;
-}
-
-/* ── Footer ── */
-Footer {
-    background: #16213e;
-    color: #565f89;
-    height: 1;
-    dock: bottom;
-}
-
-Footer > .footer--key {
-    color: #7aa2f7;
-    background: #16213e;
-}
+/* ── Header & Footer ── */
+Header { background: #0a0a0a; color: #00ffcc; height: 1; dock: top; }
+Footer { background: #0a0a0a; color: #444444; height: 1; dock: bottom; }
+Footer > .footer--key { color: #00ffcc; background: #0a0a0a; }
 
 /* ── Startup Screen ── */
-#startup-container {
-    align: center middle;
-    height: 100%;
-}
-
+#startup-container { align: center middle; height: 100%; }
 #startup-box {
-    width: 50;
-    height: 14;
-    border: round #7aa2f7;
-    background: #1f2335;
-    padding: 2 4;
+    width: 50; height: 20;
+    border: round #00ffcc; background: #111111; padding: 2 4;
 }
+#startup-title { text-align: center; color: #00ffcc; text-style: bold; margin-bottom: 1; }
+#startup-subtitle { text-align: center; color: #444444; margin-bottom: 2; }
+.startup-btn { width: 100%; margin-bottom: 1; background: #00ffcc; color: #0a0a0a; }
+.startup-btn:hover { background: #66ffdd; }
+#btn-robot { background: #ffcc00; color: #0a0a0a; }
+#btn-robot:hover { background: #ffdd44; }
 
-#startup-title {
-    text-align: center;
-    color: #7dcfff;
-    text-style: bold;
-    margin-bottom: 1;
-}
-
-#startup-subtitle {
-    text-align: center;
-    color: #565f89;
-    margin-bottom: 2;
-}
-
-.startup-option {
-    height: 3;
-    align: center middle;
-    border: round #3b4261;
-    background: #1a1b26;
-    margin-bottom: 1;
-}
-
-.startup-option:focus {
-    border: round #7aa2f7;
-    background: #1f2335;
-}
-
-.startup-key {
-    color: #7aa2f7;
-    text-style: bold;
-}
-
-#ip-input-container {
-    align: center middle;
-    height: 100%;
-}
-
-#ip-input-box {
-    width: 50;
-    height: 9;
-    border: round #7aa2f7;
-    background: #1f2335;
-    padding: 2 4;
-}
-
-#ip-prompt {
-    text-align: center;
-    color: #c0caf5;
-    margin-bottom: 1;
-}
+#ip-input-container { align: center middle; height: 100%; }
+#ip-input-box { width: 50; height: 12; border: round #00ffcc; background: #111111; padding: 2 4; }
+#ip-prompt { text-align: center; color: #e0e0e0; margin-bottom: 2; }
+#ip-input { height: 3; border: solid #00ffcc; background: #0a0a0a; color: #00ffcc; margin-bottom: 1; padding: 0 1; }
 
 /* ── Main Screen ── */
-#main-layout {
-    layout: horizontal;
-    height: 100%;
-}
+#main-layout { layout: horizontal; height: 100%; }
+#day-panel { width: 22; border-right: solid #222222; background: #111111; padding: 0 1; }
+#day-panel-title { color: #00ffcc; text-style: bold; padding: 1 0; border-bottom: solid #222222; margin-bottom: 1; }
+#day-list { height: 1fr; border: none; background: #111111; }
+#day-list > ListItem { height: 1; background: #111111; color: #666666; padding: 0 0; }
+#day-list > ListItem.selected { background: #003322; color: #00ffcc; }
+#day-list > ListItem Label { height: 1; width: 100%; }
 
-#day-panel {
-    width: 22;
-    border-right: solid #3b4261;
-    background: #1f2335;
-    padding: 0 1;
-}
+#dataset-panel { width: 1fr; padding: 0 1; }
+#dataset-panel-title { color: #e0e0e0; text-style: bold; padding: 1 0; border-bottom: solid #222222; margin-bottom: 1; }
+#dataset-table { height: 1fr; border: none; background: #0d0d0d; }
+DataTable > .datatable--header { background: #0a0a0a; color: #00ffcc; text-style: bold; }
+DataTable > .datatable--odd-row { background: #0d0d0d; }
+DataTable > .datatable--even-row { background: #111111; }
+DataTable > .datatable--cursor { background: #004422; }
 
-#day-panel-title {
-    color: #7dcfff;
-    text-style: bold;
-    padding: 1 0;
-    border-bottom: solid #3b4261;
-    margin-bottom: 1;
-}
-
-#day-list {
-    height: 1fr;
-    border: none;
-    background: #1f2335;
-}
-
-#day-list > ListItem {
-    height: 1;
-    background: #1f2335;
-    color: #a9b1d6;
-    padding: 0 0;
-}
-
-#day-list > ListItem.--highlight {
-    background: #2d3f6e;
-    color: #7dcfff;
-}
-
-#day-list > ListItem Label {
-    height: 1;
-    width: 100%;
-}
-
-#dataset-panel {
-    width: 1fr;
-    padding: 0 1;
-}
-
-#dataset-panel-title {
-    color: #c0caf5;
-    text-style: bold;
-    padding: 1 0;
-    border-bottom: solid #3b4261;
-    margin-bottom: 1;
-}
-
-#dataset-table {
-    height: 1fr;
-    border: none;
-    background: #1a1b26;
-}
-
-DataTable > .datatable--header {
-    background: #16213e;
-    color: #7aa2f7;
-    text-style: bold;
-}
-
-DataTable > .datatable--odd-row {
-    background: #1a1b26;
-}
-
-DataTable > .datatable--even-row {
-    background: #1f2335;
-}
-
-DataTable > .datatable--cursor {
-    background: #2d3f6e;
-    color: #c0caf5;
-}
-
-#search-bar {
-    dock: bottom;
-    display: none;
-    height: 3;
-    border: round #7aa2f7;
-    background: #1f2335;
-    margin: 0 1;
-}
-
-#search-bar.visible {
-    display: block;
-}
+#search-bar { dock: bottom; display: none; height: 3; border: round #00ffcc; background: #111111; margin: 0 1; }
+#search-bar.visible { display: block; }
 
 /* ── Detail Screen ── */
-#detail-layout {
-    layout: horizontal;
-    height: 100%;
-}
-
+#detail-layout { layout: horizontal; height: 100%; }
 #info-panel {
-    width: 40;
-    border-right: solid #3b4261;
-    background: #1f2335;
-    padding: 1 2;
+    width: 60; border-right: solid #222222; background: #111111; padding: 1 2;
+    scrollbar-color: #00ffcc; scrollbar-background: #111111;
 }
+#info-card-title { color: #00ffcc; text-style: bold; text-align: center; border-bottom: solid #222222; margin-bottom: 1; padding-bottom: 1; }
+#info-card-folder { color: #444444; text-align: center; margin-bottom: 1; }
+.info-field { height: auto; min-height: 1; margin-bottom: 0; }
+#info-card-footer { color: #444444; text-align: center; border-top: solid #222222; margin-top: 1; padding-top: 1; }
 
-#info-panel-title {
-    color: #7dcfff;
-    text-style: bold;
-    border-bottom: solid #3b4261;
-    margin-bottom: 1;
-    padding-bottom: 1;
-}
+#right-panel { width: 1fr; layout: vertical; }
+#top-right-panels { height: 1fr; layout: horizontal; }
+#config-panel { width: 1fr; border-right: solid #222222; padding: 1 2; }
+#stoppages-panel { width: 1fr; padding: 1 2; }
+#trip-log-panel { height: 1fr; border-top: solid #222222; padding: 1 2; }
+#trip-log-table { height: 1fr; border: none; background: #0d0d0d; }
 
-.info-row {
-    height: 1;
-    layout: horizontal;
-}
+.panel-title { color: #00ffcc; text-style: bold; border-bottom: solid #222222; margin-bottom: 1; padding-bottom: 1; }
+.scroll-content { height: 1fr; overflow-y: auto; scrollbar-color: #00ffcc; scrollbar-background: #0d0d0d; }
 
-.info-label {
-    width: 10;
-    color: #565f89;
-}
-
-.info-value {
-    color: #c0caf5;
-    width: 1fr;
-}
-
-.info-value.mode-fleet { color: #9ece6a; }
-.info-value.mode-manual { color: #e0af68; }
-.info-value.mode-simulation { color: #7aa2f7; }
-
-#diff-panel {
-    width: 1fr;
-    padding: 1 2;
-}
-
-#diff-panel-title {
-    color: #7dcfff;
-    text-style: bold;
-    border-bottom: solid #3b4261;
-    margin-bottom: 1;
-    padding-bottom: 1;
-}
-
-#diff-content {
-    height: 1fr;
-    overflow-y: auto;
-}
-
-.diff-line-add {
-    color: #9ece6a;
-    background: #1a2e1a;
-}
-
-.diff-line-remove {
-    color: #f7768e;
-    background: #2e1a1a;
-}
-
-.diff-line-meta {
-    color: #7dcfff;
-}
-
-.diff-line-normal {
-    color: #565f89;
-}
-
-.diff-empty {
-    color: #565f89;
-    text-style: italic;
-    margin-top: 2;
-}
+.stoppage-row { height: 1; color: #888888; }
+.stoppage-row-obstacle { height: 1; color: #ffaa00; }
+.empty-msg { color: #444444; text-style: italic; margin-top: 1; }
 
 /* ── Fetch Modal ── */
-FetchModal {
-    align: center middle;
-}
-
-#fetch-box {
-    width: 60;
-    height: 14;
-    border: round #7aa2f7;
-    background: #1f2335;
-    padding: 2 3;
-}
-
-#fetch-title {
-    color: #7dcfff;
-    text-style: bold;
-    text-align: center;
-    margin-bottom: 1;
-}
-
-#fetch-dataset-name {
-    color: #a9b1d6;
-    text-align: center;
-    margin-bottom: 2;
-}
-
-#fetch-progress {
-    color: #9ece6a;
-    height: 3;
-    overflow: hidden;
-}
-
-#fetch-actions {
-    layout: horizontal;
-    align: center middle;
-    margin-top: 1;
-}
-
-.fetch-btn {
-    width: 12;
-    height: 3;
-    border: round #3b4261;
-    background: #1a1b26;
-    margin: 0 1;
-    align: center middle;
-    text-align: center;
-}
-
-.fetch-btn:hover {
-    border: round #7aa2f7;
-    background: #1f2335;
-}
+FetchModal { align: center middle; }
+#fetch-box { width: 60; height: 18; border: round #00ffcc; background: #111111; padding: 2 3; }
+#fetch-title { color: #00ffcc; text-style: bold; text-align: center; margin-bottom: 1; }
+#fetch-dataset-name { color: #888888; text-align: center; margin-bottom: 1; }
+#fetch-path-label { color: #00ffcc; margin-top: 1; }
+#fetch-path-input { height: 3; margin-bottom: 1; border: solid #00ffcc; background: #0a0a0a; color: #00ffcc; padding: 0 1; }
+#fetch-progress-bar { width: 100%; margin-bottom: 1; color: #00ffcc; }
+#fetch-status { color: #e0e0e0; text-align: center; margin-bottom: 1; }
+#fetch-actions { layout: horizontal; align: center middle; margin-top: 1; }
+#confirm-btn { width: 16; margin: 0 1; background: #00ffcc; color: #0a0a0a; }
+#cancel-btn { width: 16; margin: 0 1; background: #ff4444; color: #ffffff; }
 
 /* ── Error Screen ── */
-#error-container {
-    align: center middle;
-    height: 100%;
-}
-
-#error-box {
-    width: 60;
-    height: 14;
-    border: round #f7768e;
-    background: #1f2335;
-    padding: 2 3;
-}
-
-#error-title {
-    color: #f7768e;
-    text-style: bold;
-    text-align: center;
-    margin-bottom: 1;
-}
-
-#error-message {
-    color: #a9b1d6;
-    margin-bottom: 2;
-    text-align: center;
-}
+#error-container { align: center middle; height: 100%; }
+#error-box { width: 60; height: 14; border: round #ff4444; background: #111111; padding: 2 3; }
+#error-title { color: #ff4444; text-style: bold; text-align: center; margin-bottom: 1; }
+#error-message { color: #888888; margin-bottom: 2; text-align: center; }
 """
-
-
-# ─── Custom Widgets ───────────────────────────────────────────────────────────
-
-
-class DiffLine(Static):
-    """A single line of unified diff output with appropriate styling."""
-
-    def __init__(self, line: str):
-        css_class = "diff-line-normal"
-        if line.startswith("+") and not line.startswith("+++"):
-            css_class = "diff-line-add"
-        elif line.startswith("-") and not line.startswith("---"):
-            css_class = "diff-line-remove"
-        elif line.startswith("@@") or line.startswith("---") or line.startswith("+++"):
-            css_class = "diff-line-meta"
-        super().__init__(line)
-        self.add_class(css_class)
 
 
 # ─── Screens ─────────────────────────────────────────────────────────────────
 
 
 class ErrorScreen(Screen):
-    """Full-screen error with Retry / Quit options."""
-
-    BINDINGS = [
-        Binding("r", "retry", "Retry"),
-        Binding("q", "quit", "Quit"),
-    ]
+    BINDINGS = [Binding("r", "retry", "Retry"), Binding("q", "quit", "Quit")]
 
     def __init__(self, message: str, **kwargs):
         super().__init__(**kwargs)
@@ -789,10 +627,7 @@ class ErrorScreen(Screen):
             with Vertical(id="error-box"):
                 yield Static("Connection Error", id="error-title")
                 yield Static(self._message, id="error-message")
-                yield Static(
-                    "  [r] Retry    [q] Quit  ",
-                    markup=False,
-                )
+                yield Static("  [r] Retry    [q] Quit  ", markup=False)
         yield Footer()
 
     def action_retry(self) -> None:
@@ -803,12 +638,7 @@ class ErrorScreen(Screen):
 
 
 class FetchModal(ModalScreen):
-    """Confirmation + progress modal for rsync fetch."""
-
-    BINDINGS = [
-        Binding("escape", "dismiss", "Cancel"),
-        Binding("y", "confirm", "Confirm"),
-    ]
+    BINDINGS = [Binding("escape", "dismiss", "Cancel")]
 
     def __init__(self, dataset: DatasetMeta, source: SSHSource, **kwargs):
         super().__init__(**kwargs)
@@ -820,35 +650,59 @@ class FetchModal(ModalScreen):
         with Vertical(id="fetch-box"):
             yield Static("Fetch Dataset", id="fetch-title")
             yield Static(self._dataset.folder_name, id="fetch-dataset-name")
+            yield Static("Download Destination:", id="fetch-path-label")
+            yield Input(value=str(LOCAL_DATA_PATH), id="fetch-path-input")
+            yield ProgressBar(total=100, show_eta=False, id="fetch-progress-bar")
             yield Static(
-                f"Destination: {LOCAL_DATA_PATH}/",
-                classes="diff-line-normal",
+                "Ready  [dim](Press Enter or click Confirm to fetch)[/]",
+                id="fetch-status",
             )
-            yield Static("", id="fetch-progress")
             with Horizontal(id="fetch-actions"):
-                yield Static("[y] Confirm", classes="fetch-btn", id="confirm-btn")
-                yield Static("[Esc] Cancel", classes="fetch-btn", id="cancel-btn")
+                yield Button(
+                    "Confirm", variant="success", id="confirm-btn", classes="fetch-btn"
+                )
+                yield Button(
+                    "Cancel", variant="error", id="cancel-btn", classes="fetch-btn"
+                )
 
-    def action_confirm(self) -> None:
+    @on(Button.Pressed, "#confirm-btn")
+    def on_confirm(self) -> None:
         if not self._fetching:
             self._fetching = True
-            self._do_fetch()
+            dest_path = self.query_one("#fetch-path-input", Input).value
+            self.query_one("#fetch-path-input", Input).disabled = True
+            self._do_fetch(Path(dest_path))
+
+    @on(Button.Pressed, "#cancel-btn")
+    def on_cancel(self) -> None:
+        if not self._fetching:
+            self.dismiss()
+
+    @on(Input.Submitted, "#fetch-path-input")
+    def on_path_submitted(self) -> None:
+        self.on_confirm()
 
     @work(thread=True)
-    def _do_fetch(self) -> None:
-        progress = self.query_one("#fetch-progress", Static)
-        self.app.call_from_thread(progress.update, "Starting rsync…")
+    def _do_fetch(self, dest: Path) -> None:
+        status = self.query_one("#fetch-status", Static)
+        pbar = self.query_one("#fetch-progress-bar", ProgressBar)
+        self.app.call_from_thread(status.update, "Starting rsync…")
+
         try:
-            proc = self._source.fetch_dataset(self._dataset)
-            lines = []
+            proc = self._source.fetch_dataset(self._dataset, dest)
             assert proc.stdout is not None
-            for line in proc.stdout:
-                lines.append(line.rstrip())
-                # Show last 3 lines of rsync output
-                display = "\n".join(lines[-3:])
-                self.app.call_from_thread(progress.update, display)
+
+            for line in iter(proc.stdout.readline, ""):
+                # Parse rsync --info=progress2 format to update progress bar
+                match = re.search(r"(\d+)%", line)
+                if match:
+                    pct = float(match.group(1))
+                    self.app.call_from_thread(pbar.update, progress=pct)
+                    self.app.call_from_thread(status.update, f"Downloading: {pct}%")
+
             proc.wait()
             if proc.returncode == 0:
+                self.app.call_from_thread(pbar.update, progress=100.0)
                 self.app.call_from_thread(
                     self.app.notify,
                     f"Fetched {self._dataset.folder_name}",
@@ -857,20 +711,24 @@ class FetchModal(ModalScreen):
                 self.app.call_from_thread(self.dismiss, True)
             else:
                 stderr = proc.stderr.read() if proc.stderr else ""
-                msg = f"rsync failed:\n{stderr}\n\nRe-run to resume."
-                self.app.call_from_thread(progress.update, msg)
+                self.app.call_from_thread(status.update, f"rsync failed: {stderr}")
+                self._fetching = False
+                self.app.call_from_thread(
+                    lambda: setattr(
+                        self.query_one("#fetch-path-input", Input), "disabled", False
+                    )
+                )
+
         except Exception as exc:
-            self.app.call_from_thread(
-                progress.update,
-                f"Error: {exc}\n\nRe-run to resume.",
-            )
+            self.app.call_from_thread(status.update, f"Error: {exc}")
+            self._fetching = False
 
 
 class DetailScreen(Screen):
-    """Shows Run Info + Config Diff for a single dataset."""
-
     BINDINGS = [
-        Binding("escape,b", "back", "Back"),
+        Binding("escape", "back", "Back"),
+        Binding("b", "back", "Back", show=False),
+        Binding("f", "fetch", "Fetch"),
         Binding("q", "quit_app", "Quit"),
     ]
 
@@ -879,60 +737,202 @@ class DetailScreen(Screen):
         self._dataset = dataset
         self._source = source
 
+    def action_fetch(self) -> None:
+        if not self._source.is_ssh:
+            self.app.notify("Fetch is only available in SSH mode.", severity="warning")
+            return
+        self.app.push_screen(FetchModal(self._dataset, self._source))
+
+    @staticmethod
+    def _field(label: str, value: str, value_color: str = "#e0e0e0") -> Static:
+        markup = f"[dim]{label:<14}[/]  [{value_color}]{value}[/]"
+        return Static(markup, classes="info-field")
+
     def compose(self) -> ComposeResult:
         ds = self._dataset
+        mode_colors = {"fleet": "#00ffcc", "manual": "#ffcc00", "simulation": "#4488ff"}
+        mode_color = mode_colors.get(ds.mode, "#e0e0e0")
+
         yield Header(show_clock=False)
         with Horizontal(id="detail-layout"):
-            # Left: Run Info
             with Vertical(id="info-panel"):
-                yield Static("Run Info", id="info-panel-title")
-                yield self._info_row("Robot", ds.robot)
+                yield Static("Run Info", id="info-card-title")
+                yield Static(ds.folder_name, id="info-card-folder")
+                yield self._field("Robot", ds.robot, "#00ffcc")
                 if ds.ip:
-                    yield self._info_row("IP", ds.ip)
-                yield self._info_row("Mode", ds.mode)
-                yield self._info_row("Start", ds.date.strftime("%H:%M:%S"))
-                yield self._info_row("Date", ds.date.strftime("%d %b %Y"))
-                yield self._info_row("Time", f"{ds.duration_mins:.2f} min")
-                yield self._info_row("Dist", f"{ds.distance_m:.1f} m")
+                    yield self._field("IP", ds.ip)
+                yield self._field("Mode", ds.mode, mode_color)
+                yield Static(
+                    "", id="info-card-map", classes="info-field"
+                )  # Will be populated
+                yield self._field("Date", ds.date.strftime("%d %b %Y"))
+                yield self._field("Start", ds.date.strftime("%H:%M:%S"))
+                yield self._field("Duration", f"{ds.duration_mins:.2f} min")
+                yield self._field("Distance", f"{ds.distance_m:.1f} m")
                 if ds.software_tag:
-                    yield self._info_row("Tag", ds.software_tag)
+                    yield self._field("Tag", ds.software_tag)
                 if ds.commit_id:
-                    yield self._info_row("Commit", ds.commit_id)
+                    yield self._field("Commit", ds.commit_id)
+                if ds.user:
+                    yield self._field("User", ds.user, "#00ffcc")
                 if ds.transition_reason:
-                    yield self._info_row("Reason", ds.transition_reason)
-                # Spacer + folder name at bottom
-                yield Static("")
-                yield Static(ds.folder_name, classes="diff-line-normal")
+                    yield self._field("Reason", ds.transition_reason)
+                yield Static(
+                    "[dim]Esc · b  Back   f  Fetch (SSH)   q  Quit[/]",
+                    id="info-card-footer",
+                )
 
-            # Right: Config diff
-            with Vertical(id="diff-panel"):
-                yield Static("Config Changes", id="diff-panel-title")
-                with Vertical(id="diff-content"):
-                    yield Static("Loading…", id="diff-loading")
+            with Vertical(id="right-panel"):
+                with Horizontal(id="top-right-panels"):
+                    with Vertical(id="config-panel"):
+                        yield Static("Config Changes", classes="panel-title")
+                        with Vertical(id="config-content", classes="scroll-content"):
+                            yield Static(
+                                "Loading…", classes="empty-msg", id="config-loading"
+                            )
+
+                    with Vertical(id="stoppages-panel"):
+                        yield Static(
+                            "Stoppages", classes="panel-title", id="stoppages-title"
+                        )
+                        with Vertical(id="stoppages-content", classes="scroll-content"):
+                            yield Static(
+                                "Loading…", classes="empty-msg", id="stoppages-loading"
+                            )
+
+                with Vertical(id="trip-log-panel"):
+                    yield Static("Trip Log", classes="panel-title", id="trip-log-title")
+                    yield DataTable(
+                        id="trip-log-table", zebra_stripes=True, cursor_type="row"
+                    )
 
         yield Footer()
 
-    def _info_row(self, label: str, value: str) -> Static:
-        return Static(f"{label:<8}  {value}", classes="diff-line-normal")
-
     def on_mount(self) -> None:
-        self._load_diff()
+        table = self.query_one("#trip-log-table", DataTable)
+        table.add_columns(
+            "Time",
+            "TripID",
+            "Leg",
+            "Status",
+            "Dest",
+            "Transit",
+            "Unpark",
+            "Park",
+            "WaitT",
+            "WaitO",
+            "WaitV",
+            "WaitE",
+        )
+        self._load_extras()
 
     @work(thread=True)
-    def _load_diff(self) -> None:
-        raw = self._source.read_file(self._dataset, "config-changes.txt")
-        diff = parse_config_diff(raw)
-        container = self.query_one("#diff-content")
-        self.app.call_from_thread(self._render_diff, container, diff)
+    def _load_extras(self) -> None:
+        # Load Stoppages
+        raw_stoppages = self._source.read_file(self._dataset, "debug/stoppages.csv")
+        stoppages = parse_stoppages(raw_stoppages)
 
-    def _render_diff(self, container, diff: ConfigDiff) -> None:
-        loading = self.query_one("#diff-loading", Static)
-        loading.remove()
-        if diff.is_empty:
-            container.mount(Static("No config changes recorded.", classes="diff-empty"))
+        # Load Trip Log
+        raw_trip_log = self._source.read_file(self._dataset, "debug/trip_log.csv")
+        trip_entries = parse_trip_log(raw_trip_log)
+
+        # Load Map Info
+        map_raw = self._source.read_file(self._dataset, "map_info.txt").strip()
+        if "=" in map_raw:
+            map_val = map_raw.split("=")[-1].strip()
         else:
-            for line in diff.lines:
-                container.mount(DiffLine(line))
+            map_val = map_raw
+        map_name = Path(map_val).name if map_val else "Unknown"
+
+        # Load Config Changes
+        diff_raw = self._source.read_file(self._dataset, "config-changes.txt")
+
+        self.app.call_from_thread(
+            self._render_extras, stoppages, trip_entries, map_name, diff_raw
+        )
+
+    def _render_extras(
+        self,
+        stoppages: List[StoppageEntry],
+        trip_entries: List[TripLogEntry],
+        map_name: str,
+        diff_raw: str,
+    ) -> None:
+        # Map Info
+        map_widget = self.query_one("#info-card-map", Static)
+        map_widget.update(f"[dim]{'Map':<14}[/]  [#ff99ff]{map_name}[/]")
+
+        # Config Changes
+        config_container = self.query_one("#config-content", Vertical)
+        self.query_one("#config-loading", Static).remove()
+
+        if not diff_raw.strip():
+            config_container.mount(Static("No config changes.", classes="empty-msg"))
+        else:
+            rich_diff = Text()
+            for line in diff_raw.splitlines():
+                if line.startswith("+"):
+                    rich_diff.append(line + "\n", style="green")
+                elif line.startswith("-"):
+                    rich_diff.append(line + "\n", style="red")
+                elif line.startswith("@@"):
+                    rich_diff.append(line + "\n", style="cyan")
+                else:
+                    rich_diff.append(line + "\n", style="dim")
+            config_container.mount(Static(rich_diff))
+
+        # Stoppages
+        stop_container = self.query_one("#stoppages-content", Vertical)
+        self.query_one("#stoppages-loading", Static).remove()
+
+        title = self.query_one("#stoppages-title", Static)
+        title.update(f"Stoppages  [{len(stoppages)}]")
+
+        if not stoppages:
+            stop_container.mount(Static("No stoppages recorded.", classes="empty-msg"))
+        else:
+            for entry in stoppages:
+                ts = entry.timestamp.strftime("%H:%M:%S")
+                status = entry.status
+                is_obstacle = "obstacle" in status.lower()
+                color = "#ffaa00" if is_obstacle else "#666666"
+                row = Static(
+                    f"[dim]{ts}[/]  [{color}]{status}[/]",
+                    classes="stoppage-row-obstacle" if is_obstacle else "stoppage-row",
+                )
+                stop_container.mount(row)
+
+        # Trip Log
+        trip_table = self.query_one("#trip-log-table", DataTable)
+        trip_title = self.query_one("#trip-log-title", Static)
+        trip_title.update(f"Trip Log  [{len(trip_entries)}]")
+
+        for entry in trip_entries:
+            ts = entry.time.strftime("%H:%M:%S")
+            status_lower = entry.status.lower()
+            if "failed" in status_lower or "exception" in status_lower:
+                status_color = "ff4444"
+            elif "completed" in status_lower or "arrived" in status_lower:
+                status_color = "00ff00"
+            elif "started" in status_lower or "transit" in status_lower:
+                status_color = "00ffff"
+            else:
+                status_color = "e0e0e0"
+
+            trip_table.add_row(
+                ts,
+                entry.trip_id,
+                entry.trip_leg_id,
+                f"[#{status_color}]{entry.status}[/]",
+                entry.destination,
+                f"{entry.transit_time:.1f}s",
+                f"{entry.unparking_time:.1f}s",
+                f"{entry.parking_time:.1f}s",
+                f"{entry.total_waiting_time:.1f}s",
+                f"{entry.obstacle_waiting_time:.1f}s",
+                f"{entry.visa_waiting_time:.1f}s",
+                f"{entry.exceptions_waiting_time:.1f}s",
+            )
 
     def action_back(self) -> None:
         self.app.pop_screen()
@@ -942,8 +942,6 @@ class DetailScreen(Screen):
 
 
 class MainScreen(Screen):
-    """Primary dataset browsing screen: Day panel (left) + Dataset table (right)."""
-
     BINDINGS = [
         Binding("right", "focus_datasets", show=False),
         Binding("left", "focus_days", show=False),
@@ -971,24 +969,35 @@ class MainScreen(Screen):
                 yield ListView(id="day-list")
             with Vertical(id="dataset-panel"):
                 yield Static("", id="dataset-panel-title")
-                yield DataTable(id="dataset-table", zebra_stripes=True, cursor_type="row")
+                yield DataTable(
+                    id="dataset-table", zebra_stripes=True, cursor_type="row"
+                )
                 yield Input(placeholder="Filter datasets…", id="search-bar")
         yield Footer()
 
     def on_mount(self) -> None:
         table = self.query_one("#dataset-table", DataTable)
-        table.add_columns("Date", "Day", "Robot", "Mode", "Dist", "Dur")
-        self._load_days()
+        table.add_columns(
+            "Date", "Time", "Robot", "Mode", "Dist", "Dur", "Size", "Folder"
+        )
+        self._load_all_data()
 
     @work(thread=True)
-    def _load_days(self) -> None:
+    def _load_all_data(self) -> None:
+        self.app.call_from_thread(
+            self.query_one("#dataset-panel-title", Static).update, "  Fetching index..."
+        )
         try:
             days = self._source.list_days()
+            # Prefetch all datasets for all valid days
+            for bucket in days:
+                if bucket.count > 0:
+                    self._source.list_datasets(bucket.day)
+
+            # Re-fetch days to get accurate counts from the populated cache
+            days = self._source.list_days()
         except Exception as exc:
-            self.app.call_from_thread(
-                self.app.push_screen,
-                ErrorScreen(str(exc)),
-            )
+            self.app.call_from_thread(self.app.push_screen, ErrorScreen(str(exc)))
             return
         self.app.call_from_thread(self._render_days, days)
 
@@ -999,9 +1008,8 @@ class MainScreen(Screen):
         for bucket in days:
             label = f"  {DAY_FULL[bucket.day]:<11}  {bucket.count:>3}"
             day_list.append(ListItem(Label(label), name=bucket.day))
-        # Focus day list first so user can immediately navigate
+
         day_list.focus()
-        # Load first day
         if days:
             self._load_datasets(days[0].day)
 
@@ -1016,10 +1024,7 @@ class MainScreen(Screen):
             datasets = self._source.list_datasets(day)
         except Exception as exc:
             self.app.call_from_thread(
-                self.app.notify,
-                str(exc),
-                title="SSH Error",
-                severity="error",
+                self.app.notify, str(exc), title="Source Error", severity="error"
             )
             datasets = []
         self.app.call_from_thread(self._render_datasets, day, datasets)
@@ -1036,48 +1041,68 @@ class MainScreen(Screen):
         table.clear()
         filt = self._search_filter.lower()
         shown = [
-            ds for ds in self._current_datasets
+            ds
+            for ds in self._current_datasets
             if not filt or filt in ds.folder_name.lower() or filt in ds.robot.lower()
         ]
         for ds in shown:
-            date_str = ds.date.strftime("%d %b %Y %H:%M")
-            day_str = ds.date.strftime("%a")
-            dist = f"{ds.distance_m:.1f}m"
-            dur = f"{ds.duration_mins:.1f}m"
-            mode_color = MODE_COLORS.get(ds.mode, "")
-            mode_cell = f"[{mode_color}]{ds.mode}[/]" if mode_color else ds.mode
-            table.add_row(date_str, day_str, ds.robot, mode_cell, dist, dur)
+            date_part = f"[#66ddff]{ds.date.strftime('%d %b %Y')}[/]"
+            time_part = f"[#ffcc44]{ds.date.strftime('%H:%M')}[/]"
+            robot_cell = f"[#ff88cc]{ds.robot}[/]"
+            mode_colors = {
+                "fleet": "00ffcc",
+                "manual": "ffcc00",
+                "simulation": "4488ff",
+            }
+            mc = mode_colors.get(ds.mode, "888888")
+            mode_cell = f"[#{mc}]{ds.mode}[/]"
+            dist = f"[#88ff88]{ds.distance_m:.1f}m[/]"
+            dur = f"[#ffbb66]{ds.duration_mins:.1f}m[/]"
+            size_str = (
+                f"[#bb99ff]{format_size(ds.size_bytes)}[/]" if ds.size_bytes else "-"
+            )
+            folder_cell = f"[#dddddd]{ds.folder_name}[/]"
+            table.add_row(
+                date_part,
+                time_part,
+                robot_cell,
+                mode_cell,
+                dist,
+                dur,
+                size_str,
+                folder_cell,
+            )
         if shown:
             table.move_cursor(row=0)
 
     def _get_selected_dataset(self) -> Optional[DatasetMeta]:
-        """Return the dataset under the DataTable cursor, or None."""
         table = self.query_one("#dataset-table", DataTable)
         if table.cursor_row is None:
             return None
         filt = self._search_filter.lower()
         shown = [
-            ds for ds in self._current_datasets
+            ds
+            for ds in self._current_datasets
             if not filt or filt in ds.folder_name.lower() or filt in ds.robot.lower()
         ]
         if 0 <= table.cursor_row < len(shown):
             return shown[table.cursor_row]
         return None
 
-    # ── Events ──
-
     @on(ListView.Highlighted, "#day-list")
     def on_day_highlighted(self, event: ListView.Highlighted) -> None:
-        if event.item is not None and event.item.name:
-            self._load_datasets(event.item.name)
+        for item in self.query("#day-list ListItem"):
+            item.remove_class("selected")
+        if event.item is not None:
+            event.item.add_class("selected")
+            if event.item.name:
+                self._load_datasets(event.item.name)
 
     @on(DataTable.RowSelected, "#dataset-table")
     def on_row_selected(self) -> None:
         dataset = self._get_selected_dataset()
         if dataset:
             self.app.push_screen(DetailScreen(dataset, self._source))
-
-    # ── Key actions ──
 
     def action_focus_datasets(self) -> None:
         self.query_one("#dataset-table", DataTable).focus()
@@ -1113,7 +1138,7 @@ class MainScreen(Screen):
             return
         dataset = self._get_selected_dataset()
         if dataset:
-            self.app.push_screen(FetchModal(dataset, self._source))  # type: ignore[arg-type]
+            self.app.push_screen(FetchModal(dataset, self._source))
 
     def action_quit_app(self) -> None:
         self.app.exit()
@@ -1129,8 +1154,6 @@ class MainScreen(Screen):
 
 
 class StartupScreen(Screen):
-    """Initial screen: choose Local or SSH mode."""
-
     BINDINGS = [
         Binding("l", "local", "Local"),
         Binding("r", "robot", "Robot (SSH)"),
@@ -1143,21 +1166,25 @@ class StartupScreen(Screen):
             with Vertical(id="startup-box"):
                 yield Static("Mule Dataset Browser", id="startup-title")
                 yield Static("Choose a data source", id="startup-subtitle")
-                yield Static(
-                    "[bold cyan]L[/]  Browse local datasets  ~/data/",
-                    classes="startup-option",
-                    id="opt-local",
+                yield Button(
+                    "Local (~/data/)",
+                    id="btn-local",
+                    variant="primary",
+                    classes="startup-btn",
                 )
-                yield Static(
-                    "[bold cyan]R[/]  Connect to robot  (SSH)",
-                    classes="startup-option",
-                    id="opt-robot",
+                yield Button(
+                    "Robot (SSH)",
+                    id="btn-robot",
+                    variant="warning",
+                    classes="startup-btn",
                 )
         yield Footer()
 
+    @on(Button.Pressed, "#btn-local")
     def action_local(self) -> None:
         self.app.switch_source(LocalSource())
 
+    @on(Button.Pressed, "#btn-robot")
     def action_robot(self) -> None:
         self.app.push_screen(IPInputScreen())
 
@@ -1166,21 +1193,14 @@ class StartupScreen(Screen):
 
 
 class IPInputScreen(Screen):
-    """Prompt for robot IP address."""
-
-    BINDINGS = [
-        Binding("escape", "back", "Back"),
-    ]
+    BINDINGS = [Binding("escape", "back", "Back")]
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
         with Container(id="ip-input-container"):
             with Vertical(id="ip-input-box"):
                 yield Static("Enter robot IP address:", id="ip-prompt")
-                yield Input(
-                    placeholder="192.168.x.x",
-                    id="ip-input",
-                )
+                yield Input(placeholder="192.168.x.x", id="ip-input")
         yield Footer()
 
     def on_mount(self) -> None:
@@ -1200,17 +1220,15 @@ class IPInputScreen(Screen):
 
 
 class MuleBrowser(App):
-    """Mule Dataset Browser TUI application."""
-
     CSS = APP_CSS
     TITLE = "Mule Dataset Browser"
     SUB_TITLE = ""
 
-    BINDINGS = [
-        Binding("q", "quit", "Quit", show=True),
-    ]
+    BINDINGS = [Binding("q", "quit", "Quit", show=True)]
 
-    def __init__(self, initial_ip: Optional[str] = None, start_local: bool = False, **kwargs):
+    def __init__(
+        self, initial_ip: Optional[str] = None, start_local: bool = False, **kwargs
+    ):
         super().__init__(**kwargs)
         self._initial_ip = initial_ip
         self._start_local = start_local
@@ -1225,7 +1243,6 @@ class MuleBrowser(App):
 
     def switch_source(self, source: DataSource) -> None:
         self.SUB_TITLE = source.label
-        # Clear the screen stack down to root, then push MainScreen
         while len(self._screen_stack) > 1:
             self.pop_screen()
         self.push_screen(MainScreen(source))
@@ -1237,8 +1254,7 @@ class MuleBrowser(App):
             source.connect()
         except Exception as exc:
             self.call_from_thread(
-                self.push_screen,
-                ErrorScreen(f"Cannot connect to {ip}:\n{exc}"),
+                self.push_screen, ErrorScreen(f"Cannot connect to {ip}:\n{exc}")
             )
             return
         self.call_from_thread(self.switch_source, source)
@@ -1254,15 +1270,12 @@ def main() -> None:
         epilog="""
 Examples:
   python mule_browser.py                 # startup menu
-  python mule_browser.py 192.168.6.180  # SSH mode directly
-  python mule_browser.py --local        # local mode directly
+  python mule_browser.py 192.168.6.180   # SSH mode directly
+  python mule_browser.py --local         # local mode directly
         """,
     )
     parser.add_argument(
-        "ip",
-        nargs="?",
-        default=None,
-        help="Robot IP address for SSH mode (optional)",
+        "ip", nargs="?", default=None, help="Robot IP address for SSH mode (optional)"
     )
     parser.add_argument(
         "--local",
