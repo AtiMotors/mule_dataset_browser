@@ -743,9 +743,9 @@ FetchModal { align: center middle; }
 
 /* ── Fetch Index Modal ── */
 FetchIndexModal { align: center middle; }
-#fetch-index-box { width: 40; height: 10; border: round #00ffcc; background: #111111; padding: 2 3; }
+#fetch-index-box { width: 52; height: 20; border: round #00ffcc; background: #111111; padding: 2 4; }
 #fetch-index-title { color: #00ffcc; text-style: bold; text-align: center; margin-bottom: 2; }
-#fetch-index-spinner { height: 1; color: #00ffcc; text-align: center; text-style: bold; }
+#fetch-index-spinner { height: 9; color: #00ffcc; text-align: center; padding: 0 0; }
 """
 
 
@@ -776,19 +776,28 @@ class ErrorScreen(Screen):
 
 
 class FetchIndexModal(ModalScreen):
-    """Modal showing spinner while fetching dataset index."""
+    """Modal showing orbiting dots animation."""
 
-    SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    SPINNERS = [
+        "    •    \n    •    \n    •    \n  • ◯ •  \n    •    \n    •    \n    •    ",
+        "   •     \n   • •   \n  •   •  \n  • ◯ •  \n  •   •  \n   • •   \n   •     ",
+        "   •    \n  •  •  \n •    • \n•  ◯  • \n •    • \n  •  •  \n   •    ",
+        "  •  •  \n •    • \n•      •\n•  ◯  •\n•      •\n •    • \n  •  •  ",
+        " •    • \n•      •\n•      •\n•  ◯  •\n•      •\n•      •\n •    • ",
+        "•      •\n•      •\n •    • \n•  ◯  •\n •    • \n•      •\n•      •",
+        "•      •\n •    • \n •    • \n•  ◯  •\n •    • \n •    • \n•      •",
+        " •    • \n •    • \n•      •\n•  ◯  •\n•      •\n •    • \n •    • ",
+    ]
     _spinner_idx = 0
 
     def compose(self) -> ComposeResult:
         with Vertical(id="fetch-index-box"):
             yield Static("Fetching dataset info", id="fetch-index-title")
-            yield Static("", id="fetch-index-spinner")
+            yield Static(self.SPINNERS[0], id="fetch-index-spinner")
 
     def on_mount(self) -> None:
         # Start spinner animation
-        self.set_interval(0.1, self._update_spinner)
+        self.set_interval(0.12, self._update_spinner)
 
     def _update_spinner(self) -> None:
         spinner = self.query_one("#fetch-index-spinner", Static)
