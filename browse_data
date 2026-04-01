@@ -740,6 +740,12 @@ FetchModal { align: center middle; }
 #dataset-loading.active {
     display: block;
 }
+
+/* ── Fetch Index Modal ── */
+FetchIndexModal { align: center middle; }
+#fetch-index-box { width: 40; height: 10; border: round #00ffcc; background: #111111; padding: 2 3; }
+#fetch-index-title { color: #00ffcc; text-style: bold; text-align: center; margin-bottom: 2; }
+#fetch-index-spinner { height: 1; color: #00ffcc; text-align: center; text-style: bold; }
 """
 
 
@@ -767,6 +773,27 @@ class ErrorScreen(Screen):
 
     def action_quit(self) -> None:
         self.app.exit()
+
+
+class FetchIndexModal(ModalScreen):
+    """Modal showing spinner while fetching dataset index."""
+
+    SPINNERS = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", "⠇", "⠏"]
+    _spinner_idx = 0
+
+    def compose(self) -> ComposeResult:
+        with Vertical(id="fetch-index-box"):
+            yield Static("Fetching dataset info", id="fetch-index-title")
+            yield Static("", id="fetch-index-spinner")
+
+    def on_mount(self) -> None:
+        # Start spinner animation
+        self.set_interval(0.1, self._update_spinner)
+
+    def _update_spinner(self) -> None:
+        spinner = self.query_one("#fetch-index-spinner", Static)
+        spinner.update(self.SPINNERS[self._spinner_idx % len(self.SPINNERS)])
+        self._spinner_idx += 1
 
 
 class FetchModal(ModalScreen):
@@ -1128,12 +1155,15 @@ class MainScreen(Screen):
 
     @work(thread=True)
     def _load_all_data(self) -> None:
+        # Show the loading modal
         self.app.call_from_thread(
-            self.query_one("#dataset-panel-title", Static).update, "  Fetching index..."
+            self.app.push_screen, FetchIndexModal()
         )
+
         try:
             days = self._source.list_days()
         except Exception as exc:
+            self.app.call_from_thread(self.app.pop_screen)
             self.app.call_from_thread(self.app.push_screen, ErrorScreen(str(exc)))
             return
 
@@ -1143,6 +1173,7 @@ class MainScreen(Screen):
         # Fetch datasets for each non-empty day in parallel
         non_empty = [b for b in days if b.count > 0]
         if not non_empty:
+            self.app.call_from_thread(self.app.pop_screen)
             return
 
         errors: List[str] = []
@@ -1157,6 +1188,9 @@ class MainScreen(Screen):
                     future.result()  # populates self._source._cache[day]
                 except Exception as exc:
                     errors.append(f"{day}: {exc}")
+
+        # Dismiss the loading modal
+        self.app.call_from_thread(self.app.pop_screen)
 
         if errors:
             self.app.call_from_thread(
@@ -1303,10 +1337,23 @@ class MainScreen(Screen):
             self.query_one("#dataset-table", DataTable).focus()
 
     def action_jump_latest(self) -> None:
-        table = self.query_one("#dataset-table", DataTable)
-        if self._current_datasets:
-            table.move_cursor(row=0)
-            table.focus()
+        """Find and focus the latest dataset across all days."""
+        latest_dataset: Optional[DatasetMeta] = None
+        latest_day: Optional[str] = None
+
+        # Search all cached days for the latest dataset
+        for day in self._days:
+            if day.day in self._source._cache:
+                datasets = self._source._cache[day.day]
+                if datasets and (latest_dataset is None or datasets[0].date > latest_dataset.date):
+                    latest_dataset = datasets[0]
+                    latest_day = day.day
+
+        # If found, navigate to that day and focus the dataset
+        if latest_dataset and latest_day:
+            self._load_datasets(latest_day)
+            # Focus table after a brief delay for data to render
+            self.call_later(lambda: self.query_one("#dataset-table", DataTable).focus())
 
     def action_fetch(self) -> None:
         if not self._source.is_ssh:
