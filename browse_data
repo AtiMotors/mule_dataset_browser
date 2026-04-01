@@ -11,9 +11,11 @@ from __future__ import annotations
 
 import argparse
 import ipaddress
+import os
 import re
 import subprocess
 from abc import ABC, abstractmethod
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from dataclasses import dataclass, field
 from datetime import datetime
 from pathlib import Path
@@ -37,6 +39,7 @@ try:
         Label,
         ListItem,
         ListView,
+        LoadingIndicator,
         ProgressBar,
         Static,
     )
@@ -333,6 +336,21 @@ def weekday_from_date(dt: datetime) -> str:
     return dt.strftime("%a")
 
 
+def _dir_size(path: Path) -> int:
+    """Return total size of all files under path, in bytes."""
+    total = 0
+    try:
+        for dirpath, _dirnames, filenames in os.walk(path):
+            for fname in filenames:
+                try:
+                    total += os.stat(os.path.join(dirpath, fname)).st_size
+                except OSError:
+                    pass
+    except OSError:
+        pass
+    return total
+
+
 # ─── Data Sources ─────────────────────────────────────────────────────────────
 
 
@@ -354,6 +372,12 @@ class DataSource(ABC):
     @abstractmethod
     def read_file(self, dataset: DatasetMeta, filename: str) -> str:
         pass
+
+    def read_files_batch(
+        self, dataset: DatasetMeta, filenames: List[str]
+    ) -> Dict[str, str]:
+        """Fetch multiple files. Default: sequential fallback."""
+        return {f: self.read_file(dataset, f) for f in filenames}
 
     @property
     @abstractmethod
@@ -407,17 +431,7 @@ class LocalSource(DataSource):
             except FileNotFoundError:
                 raw_info = ""
             meta = build_dataset_meta(entry.name, raw_info)
-            try:
-                size = subprocess.run(
-                    ["du", "-sb", str(entry)],
-                    capture_output=True,
-                    text=True,
-                    timeout=10,
-                )
-                if size.returncode == 0:
-                    meta.size_bytes = int(size.stdout.split()[0])
-            except Exception:
-                pass
+            meta.size_bytes = _dir_size(entry)
             grouped[day].append(meta)
         for day in grouped:
             grouped[day].sort(key=lambda m: m.date, reverse=True)
@@ -475,16 +489,27 @@ class SSHSource(DataSource):
         self._robot_name = out.strip()
 
     def list_days(self) -> List[DayBucket]:
-        # Use a simple 'ls | wc -l' as requested by the user
-        result = []
-        for day in DAY_ORDER:
-            try:
-                out = self._ssh(f"ls {ROBOT_BASE_PATH}/{day}/ 2>/dev/null | wc -l")
-                count = int(out.strip())
-            except Exception:
-                count = 0
-            result.append(DayBucket(day=day, count=count))
-        return result
+        script = (
+            "for day in Mon Tue Wed Thu Fri Sat Sun; do "
+            f"  count=$(ls {ROBOT_BASE_PATH}/$day/ 2>/dev/null | wc -l); "
+            "  printf '%s:%s\\n' \"$day\" \"$count\"; "
+            "done"
+        )
+        try:
+            out = self._ssh(script)
+        except Exception:
+            return [DayBucket(day=d, count=0) for d in DAY_ORDER]
+
+        counts: Dict[str, int] = {}
+        for line in out.splitlines():
+            line = line.strip()
+            if ":" in line:
+                day, _, raw = line.partition(":")
+                try:
+                    counts[day.strip()] = int(raw.strip())
+                except ValueError:
+                    counts[day.strip()] = 0
+        return [DayBucket(day=d, count=counts.get(d, 0)) for d in DAY_ORDER]
 
     def list_datasets(self, day: str) -> List[DatasetMeta]:
         if day in self._cache:
@@ -545,6 +570,47 @@ class SSHSource(DataSource):
             return self._ssh(f"cat {path} 2>/dev/null || true")
         except Exception:
             return ""
+
+    def read_files_batch(
+        self, dataset: DatasetMeta, filenames: List[str]
+    ) -> Dict[str, str]:
+        """Fetch multiple files in a single SSH call.
+
+        Returns a dict mapping filename -> contents.
+        Missing files produce an empty string value.
+        """
+        day = weekday_from_date(dataset.date)
+        base = f"{ROBOT_BASE_PATH}/{day}/{dataset.folder_name}"
+        # Build a shell fragment: for each file, print delimiter+name then cat
+        delim = "<<<FILE_BOUNDARY>>>"
+        parts = []
+        for fname in filenames:
+            safe_path = f"{base}/{fname}"
+            parts.append(
+                f"printf '{delim}%s\\n' '{fname}'; "
+                f"cat '{safe_path}' 2>/dev/null; "
+                f"printf '\\n'"
+            )
+        script = "; ".join(parts)
+        try:
+            out = self._ssh(script)
+        except Exception:
+            return {f: "" for f in filenames}
+
+        result: Dict[str, str] = {f: "" for f in filenames}
+        current_key: Optional[str] = None
+        buf: List[str] = []
+        for line in out.splitlines():
+            if line.startswith(delim):
+                if current_key is not None:
+                    result[current_key] = "\n".join(buf)
+                current_key = line[len(delim):]
+                buf = []
+            elif current_key is not None:
+                buf.append(line)
+        if current_key is not None:
+            result[current_key] = "\n".join(buf)
+        return result
 
     def fetch_dataset(self, dataset: DatasetMeta, dest: Path) -> subprocess.Popen:
         day = weekday_from_date(dataset.date)
@@ -663,6 +729,17 @@ FetchModal { align: center middle; }
 #error-box { width: 60; height: 14; border: round #ff4444; background: #111111; padding: 2 3; }
 #error-title { color: #ff4444; text-style: bold; text-align: center; margin-bottom: 1; }
 #error-message { color: #888888; margin-bottom: 2; text-align: center; }
+
+/* ── Loading Indicator ── */
+#dataset-loading {
+    display: none;
+    height: 3;
+    color: #00ffcc;
+    background: #0d0d0d;
+}
+#dataset-loading.active {
+    display: block;
+}
 """
 
 
@@ -891,24 +968,25 @@ class DetailScreen(Screen):
 
     @work(thread=True)
     def _load_extras(self) -> None:
-        # Load Stoppages
-        raw_stoppages = self._source.read_file(self._dataset, "debug/stoppages.csv")
-        stoppages = parse_stoppages(raw_stoppages)
+        files = [
+            "debug/stoppages.csv",
+            "debug/trip_log.csv",
+            "map_info.txt",
+            "config-changes.txt",
+        ]
+        data = self._source.read_files_batch(self._dataset, files)
 
-        # Load Trip Log
-        raw_trip_log = self._source.read_file(self._dataset, "debug/trip_log.csv")
-        trip_entries = parse_trip_log(raw_trip_log)
+        stoppages = parse_stoppages(data["debug/stoppages.csv"])
+        trip_entries = parse_trip_log(data["debug/trip_log.csv"])
 
-        # Load Map Info
-        map_raw = self._source.read_file(self._dataset, "map_info.txt").strip()
+        map_raw = data["map_info.txt"].strip()
         if "=" in map_raw:
             map_val = map_raw.split("=")[-1].strip()
         else:
             map_val = map_raw
         map_name = Path(map_val).name if map_val else "Unknown"
 
-        # Load Config Changes
-        diff_raw = self._source.read_file(self._dataset, "config-changes.txt")
+        diff_raw = data["config-changes.txt"]
 
         self.app.call_from_thread(
             self._render_extras, stoppages, trip_entries, map_name, diff_raw
@@ -1024,6 +1102,7 @@ class MainScreen(Screen):
         self._days: List[DayBucket] = []
         self._current_datasets: List[DatasetMeta] = []
         self._search_active = False
+        self._search_timer: Optional[object] = None
 
     def compose(self) -> ComposeResult:
         yield Header(show_clock=False)
@@ -1033,6 +1112,7 @@ class MainScreen(Screen):
                 yield ListView(id="day-list")
             with Vertical(id="dataset-panel"):
                 yield Static("", id="dataset-panel-title")
+                yield LoadingIndicator(id="dataset-loading")
                 yield DataTable(
                     id="dataset-table", zebra_stripes=True, cursor_type="row"
                 )
@@ -1053,20 +1133,38 @@ class MainScreen(Screen):
         )
         try:
             days = self._source.list_days()
-            # Prefetch all datasets for all valid days
-            for bucket in days:
-                if bucket.count > 0:
-                    self._source.list_datasets(bucket.day)
-
-            # Re-fetch days to get accurate counts from the populated cache
-            days = self._source.list_days()
         except Exception as exc:
-            self.app.call_from_thread(
-                self.query_one("#loading-overlay", Container).remove_class, "visible"
-            )
             self.app.call_from_thread(self.app.push_screen, ErrorScreen(str(exc)))
             return
+
+        # Show the sidebar immediately with the counts we already have
         self.app.call_from_thread(self._render_days, days)
+
+        # Fetch datasets for each non-empty day in parallel
+        non_empty = [b for b in days if b.count > 0]
+        if not non_empty:
+            return
+
+        errors: List[str] = []
+        with ThreadPoolExecutor(max_workers=4) as pool:
+            futures = {
+                pool.submit(self._source.list_datasets, b.day): b.day
+                for b in non_empty
+            }
+            for future in as_completed(futures):
+                day = futures[future]
+                try:
+                    future.result()  # populates self._source._cache[day]
+                except Exception as exc:
+                    errors.append(f"{day}: {exc}")
+
+        if errors:
+            self.app.call_from_thread(
+                self.app.notify,
+                "Some days failed to load: " + "; ".join(errors),
+                title="Partial Load",
+                severity="warning",
+            )
 
     def _render_days(self, days: List[DayBucket]) -> None:
         self._days = days
@@ -1079,6 +1177,14 @@ class MainScreen(Screen):
         day_list.focus()
         if days:
             self._load_datasets(days[0].day)
+
+    def _set_loading(self, active: bool) -> None:
+        """Show or hide the loading indicator."""
+        indicator = self.query_one("#dataset-loading", LoadingIndicator)
+        if active:
+            indicator.add_class("active")
+        else:
+            indicator.remove_class("active")
 
     def _load_datasets(self, day: str) -> None:
         title = self.query_one("#dataset-panel-title", Static)
@@ -1185,6 +1291,9 @@ class MainScreen(Screen):
 
     def action_close_search(self) -> None:
         if self._search_active:
+            if self._search_timer is not None:
+                self._search_timer.stop()
+                self._search_timer = None
             search_bar = self.query_one("#search-bar", Input)
             self._search_active = False
             search_bar.remove_class("visible")
@@ -1220,6 +1329,16 @@ class MainScreen(Screen):
     @on(Input.Changed, "#search-bar")
     def on_search_changed(self, event: Input.Changed) -> None:
         self._search_filter = event.value
+        # Cancel any pending debounce timer
+        if self._search_timer is not None:
+            self._search_timer.stop()
+            self._search_timer = None
+        # Schedule a refresh 150ms from now
+        self._search_timer = self.set_timer(0.15, self._do_debounced_refresh)
+
+    def _do_debounced_refresh(self) -> None:
+        """Refresh table after debounce timer expires."""
+        self._search_timer = None
         self._refresh_table()
 
     @on(Input.Submitted, "#search-bar")
